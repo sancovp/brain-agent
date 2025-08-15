@@ -1,24 +1,25 @@
 [build-system]
-requires = ["setuptools>=45", "wheel"]
+requires = ["setuptools>=61", "wheel", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "brain-agent"
 version = "0.1.1"
-description = "Neural-inspired knowledge retrieval system built on heaven-base"
+description = "Cognitive processing system for HEAVEN - Handles knowledge synthesis across any corpus size"
 readme = "README.md"
-license = {text = "MIT"}
 authors = [
-    {name = "HEAVEN Team", email = "heaven@example.com"}
+    {name = "HEAVEN Team", email = "heaven@example.com"},
 ]
+license = {text = "MIT"}
 classifiers = [
     "Development Status :: 3 - Alpha",
-    "Intended Audience :: Developers", 
+    "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 requires-python = ">=3.10"
 dependencies = [
@@ -27,22 +28,25 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=6.0",
-    "black",
-    "flake8", 
-    "mypy",
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "black>=23.0",
+    "ruff>=0.1.0",
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/brain-agent"
-Repository = "https://github.com/yourusername/brain-agent"
-Issues = "https://github.com/yourusername/brain-agent/issues"
+Homepage = "https://github.com/sancovp/brain-agent"
+Repository = "https://github.com/sancovp/brain-agent.git"
+Documentation = "https://brain-agent.readthedocs.io"
+Issues = "https://github.com/sancovp/brain-agent/issues"
+
+[tool.setuptools]
+packages = ["brain_agent"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
 
 [tool.black]
-line-length = 88
+line-length = 100
 target-version = ['py310']
-
-[tool.mypy]
-python_version = "3.10"
-warn_return_any = true
-warn_unused_configs = true
