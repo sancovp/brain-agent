@@ -1,0 +1,20 @@
+{
+  "summarize": {
+    "id": "summarize",
+    "name": "Summarize",
+    "description": "Comprehensively summarize in granular detail how the neuron content relates to the query.",
+    "prompt_block": "Task: Provide a clear, structured summary. Separate \u2018Neuron Content\u2019 from \u2018Query\u2019 and then explain, point-by-point, how the former relates to the latter."
+  },
+  "imagine": {
+    "id": "imagine",
+    "name": "Imagine",
+    "description": "The query describes an imaginary idea. Imagine how the neuron content could relate to it.",
+    "prompt_block": "Task: Think creatively. Describe potential connections, synergies, or inspirations between the neuron content and the imagined scenario in the query."
+  },
+  "reify": {
+    "id": "reify",
+    "name": "Reify",
+    "description": "The query proposes a concrete idea. Detail how the neuron content can be used to make it real.",
+    "prompt_block": "Task: Provide actionable steps and considerations to turn the query\u2019s idea into reality using insights from the neuron content."
+  }
+}

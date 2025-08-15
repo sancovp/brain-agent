@@ -1,0 +1,22 @@
+{
+  "test_brain": {
+    "directory": "/home/GOD/core/computer_use_demo/codebase_analyzer_system/brain_agent/tests/test_doc",
+    "brain_name": "test_brain",
+    "chunk_size": -1
+  },
+  "diplomacy_brain": {
+    "directory": "/home/GOD/core/computer_use_demo/codebase_analyzer_system/brain_agent/test_diplomacy_brain/",
+    "brain_name": "diplomacy_brain",
+    "chunk_size": -1
+  },
+  "heaven_cheatsheets_brain": {
+    "directory": "/home/GOD/core/computer_use_demo/tools/base/brains/cheatsheets_registry_brain/",
+    "brain_name": "heaven_cheatsheets_brain",
+    "chunk_size": -1
+  },
+  "diplomacy_test": {
+    "directory": "/home/GOD/core/computer_use_demo/codebase_analyzer_system/brain_agent/test_diplomacy_brain",
+    "brain_name": "diplomacy_test",
+    "chunk_size": -1
+  }
+}

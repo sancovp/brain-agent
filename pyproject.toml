@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brain-agent"
+version = "0.1.1"
+description = "Neural-inspired knowledge retrieval system built on heaven-base"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "HEAVEN Team", email = "heaven@example.com"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers", 
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "heaven-framework>=0.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "black",
+    "flake8", 
+    "mypy",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/brain-agent"
+Repository = "https://github.com/yourusername/brain-agent"
+Issues = "https://github.com/yourusername/brain-agent/issues"
+
+[tool.black]
+line-length = 88
+target-version = ['py310']
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
