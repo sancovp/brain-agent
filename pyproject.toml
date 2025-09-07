@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "brain-agent"
-version = "0.1.1"
+version = "0.1.2"
 description = "Cognitive processing system for HEAVEN - Handles knowledge synthesis across any corpus size"
 readme = "README.md"
 authors = [

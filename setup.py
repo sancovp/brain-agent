@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="brain-agent",
-    version="0.1.1",
+    version="0.1.2",
     description="Neural-inspired knowledge retrieval system built on heaven-base",
     packages=find_packages(),
     python_requires=">=3.10",
