@@ -3,6 +3,7 @@ Brain Agent Tools - Corrected implementation using HEAVEN's prompt_suffix_blocks
 Following HEAVEN's pattern: Never override _run or _arun, always use func attribute
 """
 
+import ast
 import os
 import json
 import re
@@ -55,7 +56,25 @@ def _parse_composite_query(query: str) -> Tuple[str, Optional[str], Optional[str
 
 def _build_enhanced_prompt_suffix_blocks(neuron_path: str, persona_id: Optional[str], mode_id: Optional[str]) -> List[str]:
     """Build prompt_suffix_blocks with neuron path and persona/mode registry lookups."""
-    blocks = [f"path={neuron_path}"]
+    blocks = []
+    
+    # Handle different neuron types
+    if neuron_path.startswith("registry_key:"):
+        # Format: registry_key:registry_name:key
+        _, registry_name, key = neuron_path.split(":", 2)
+        blocks.append(f'registry_heaven_variable={{"registry_name": "{registry_name}", "key": "{key}"}}')
+    elif neuron_path.startswith("registry_entire:"):
+        # Format: registry_entire:registry_name
+        _, registry_name = neuron_path.split(":", 1)
+        blocks.append(f'registry_heaven_variable={{"registry_name": "{registry_name}"}}')
+    elif neuron_path.startswith("file_chunk:"):
+        # Format: file_chunk:file_path:start:end
+        parts = neuron_path.split(":", 3)
+        file_path, start, end = parts[1], int(parts[2]), int(parts[3])
+        blocks.append(f"file_chunk={file_path}:{start}:{end}")
+    else:
+        # Regular file path
+        blocks.append(f"path={neuron_path}")
     
     if persona_id:
         blocks.append(f'registry_heaven_variable={{"registry_name": "brain_personas_registry", "key": "{persona_id}"}}')
@@ -77,19 +96,71 @@ def _should_include_file(file_path: str) -> bool:
         return False
     return True
 
-def _load_neurons(directory: str) -> List[str]:
-    """Load all valid neuron files from a directory."""
+def _load_neurons(brain_cfg: BrainConfig) -> List[str]:
+    """Load neurons based on brain configuration."""
     neurons = []
-    logger.debug_print(f"Scanning directory: {directory}")
-    for root, _, files in os.walk(directory):
-        logger.debug_print(f"Found {len(files)} files in {root}")
-        for file_name in files:
-            file_path = os.path.join(root, file_name)
-            if _should_include_file(file_path):
-                neurons.append(file_path)
-                logger.debug_print(f"Including neuron: {file_path}")
-            else:
-                logger.debug_print(f"Skipping file: {file_path}")
+    
+    if brain_cfg.neuron_source_type == "directory":
+        # Original file-based loading
+        directory = brain_cfg.neuron_source
+        logger.debug_print(f"Loading neurons from directory: {directory}")
+        for root, _, files in os.walk(directory):
+            for file_name in files:
+                file_path = os.path.join(root, file_name)
+                if _should_include_file(file_path):
+                    neurons.append(file_path)
+                    
+    elif brain_cfg.neuron_source_type == "registry_keys":
+        # Each registry key becomes one neuron
+        registry_name = brain_cfg.neuron_source
+        logger.debug_print(f"Loading neurons from registry keys: {registry_name}")
+        result = registry_util_func("get_all", registry_name=registry_name)
+        
+        if "Items in registry" in result:
+            try:
+                # Parse registry data (Python dict format)
+                start_idx = result.find("{")
+                if start_idx != -1:
+                    dict_str = result[start_idx:]
+                    # Use ast.literal_eval to safely parse Python dict format
+                    registry_data = ast.literal_eval(dict_str)
+                    
+                    # Each key becomes a neuron identifier
+                    for key in registry_data.keys():
+                        neurons.append(f"registry_key:{registry_name}:{key}")
+                        
+            except Exception as e:
+                logger.debug_print(f"Failed to parse registry data: {e}")
+                
+    elif brain_cfg.neuron_source_type == "entire_registry":
+        # Entire registry as one neuron
+        registry_name = brain_cfg.neuron_source
+        logger.debug_print(f"Loading entire registry as neuron: {registry_name}")
+        neurons.append(f"registry_entire:{registry_name}")
+        
+    elif brain_cfg.neuron_source_type == "file":
+        # Single file, potentially chunked
+        file_path = brain_cfg.neuron_source
+        logger.debug_print(f"Loading neurons from file: {file_path}")
+        
+        if os.path.exists(file_path):
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    
+                # Chunk if needed
+                if len(content) > brain_cfg.chunk_max:
+                    # Simple chunking by character count
+                    chunk_size = brain_cfg.chunk_max
+                    for i in range(0, len(content), chunk_size):
+                        chunk_end = min(i + chunk_size, len(content))
+                        neurons.append(f"file_chunk:{file_path}:{i}:{chunk_end}")
+                else:
+                    neurons.append(file_path)
+                    
+            except Exception as e:
+                logger.debug_print(f"Failed to read file {file_path}: {e}")
+    
     logger.debug_print(f"Total neurons loaded: {len(neurons)}")
     return neurons
 
@@ -140,8 +211,8 @@ async def cognize_func(brain: str, query: str) -> Dict[str, Any]:
         logger.debug_print(f"Could not resolve HEAVEN_DATA_DIR, using directory as-is: {e}")
         resolved_directory = brain_cfg.directory
     
-    # Load all neurons from directory
-    neuron_paths = _load_neurons(resolved_directory)
+    # Load all neurons based on brain config
+    neuron_paths = _load_neurons(brain_cfg)
     if not neuron_paths:
         return {"relevant_neurons": [], "reasoning": {}}
         
@@ -178,9 +249,12 @@ async def cognize_func(brain: str, query: str) -> Dict[str, Any]:
         message_lists.append(messages)
         
     # Process all neurons in parallel
+    import time
+    start_time = time.time()
+    logger.debug_print(f"🚀 Starting batch processing of {len(message_lists)} neurons...")
     responses = await unified_chat.abatch(message_lists)
-    # Check what we got back
-    logger.debug_print(f"Got {len(responses)} responses")
+    batch_time = time.time() - start_time
+    logger.debug_print(f"✅ Batch completed in {batch_time:.2f} seconds for {len(responses)} responses")
     for i, response in enumerate(responses):
         logger.debug_print(f"Response {i}: {response}")
         logger.debug_print(f"Response content: {response.content[:200]}...")  # First 200 chars
@@ -295,7 +369,12 @@ async def instruct_func(brain: str, query: str, neurons: List[str], reasoning: D
         message_lists.append(messages)
         
     # Process all neurons in parallel
+    import time
+    start_time = time.time()
+    logger.debug_print(f"🚀 Starting InstructTool batch processing of {len(message_lists)} neurons...")
     responses = await unified_chat.abatch(message_lists)
+    batch_time = time.time() - start_time
+    logger.debug_print(f"✅ InstructTool batch completed in {batch_time:.2f} seconds for {len(responses)} responses")
     
     # Process responses
     instruction_map = {}

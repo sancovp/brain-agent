@@ -14,7 +14,10 @@ def brain_manager_func(
     knowledge_source: Optional[str] = None,
     base_system_prompt: Optional[str] = None,
     allowed_personas: Optional[List[str]] = None,
-    allowed_modes: Optional[List[str]] = None
+    allowed_modes: Optional[List[str]] = None,
+    neuron_source_type: Optional[str] = None,
+    neuron_source: Optional[str] = None,
+    chunk_max: Optional[int] = None
 ) -> str:
     """Manages CRUD operations for the brain_configs_registry."""
     registry_name = "brain_configs"
@@ -31,6 +34,12 @@ def brain_manager_func(
         value_dict['allowed_personas'] = allowed_personas
     if allowed_modes is not None:
         value_dict['allowed_modes'] = allowed_modes
+    if neuron_source_type is not None:
+        value_dict['neuron_source_type'] = neuron_source_type
+    if neuron_source is not None:
+        value_dict['neuron_source'] = neuron_source
+    if chunk_max is not None:
+        value_dict['chunk_max'] = chunk_max
 
     return registry_util_func(
         registry_name=registry_name,
@@ -68,6 +77,18 @@ class BrainManagerToolArgsSchema(ToolArgsSchema):
         'allowed_modes': {
             'name': 'allowed_modes', 'type': 'List[str]', 'required': False,
             'description': "List of mode IDs compatible with this brain."
+        },
+        'neuron_source_type': {
+            'name': 'neuron_source_type', 'type': 'str', 'required': False,
+            'description': "How to load neurons: 'registry_keys', 'entire_registry', 'directory', 'file'"
+        },
+        'neuron_source': {
+            'name': 'neuron_source', 'type': 'str', 'required': False,
+            'description': "Registry name, directory path, or file path for neuron source"
+        },
+        'chunk_max': {
+            'name': 'chunk_max', 'type': 'int', 'required': False,
+            'description': "Maximum characters per chunk (for file chunking)"
         }
     }
 
