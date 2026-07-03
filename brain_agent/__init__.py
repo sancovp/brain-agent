@@ -1,37 +1,26 @@
-"""Brain Agent — hierarchical brains, RLM, and the judge/fill server.
+"""Brain Agent — neural-inspired knowledge synthesis on HEAVEN.
 
-The hierarchical/RLM/server layer is dependency-light (anthropic + fastapi +
-uvicorn). The LEGACY heaven-based agent (BrainAgent, the *Tool classes, the
-replicants) needs the optional 'heaven' extra: pip install brain-agent[heaven].
-Its symbols are imported lazily and are simply absent if heaven isn't present,
-so 'from brain_agent.rlm import RLM' never drags in the heaven stack.
+Everything runs on heaven (UnifiedChat + HeavenAgentConfig). There is no
+provider-SDK path — heaven owns model routing and auth.
+
+  BrainAgent / CognizeTool / InstructTool   the canonical flat brain (replicant)
+  Brain / build_digests                     recursive brains-whose-neurons-are-brains
+  RLM                                        recursive language model over a growing corpus
 """
 
-# ── dependency-light core (always available) ──────────────────────────────────
+# ── canonical heaven brain (the substrate everything extends) ─────────────────
 from .config import BrainConfig
+from .brain_agent import BrainAgent, register_brain, get_brain_config
+from .tools import CognizeTool, InstructTool
+
+# ── hierarchical brains + RLM (extend the canonical brain to depth N) ─────────
 from .hierarchical import Brain, FileNeuron, build_digests
 from .rlm import RLM, RLMResult
 
 __all__ = [
     "BrainConfig",
+    "BrainAgent", "register_brain", "get_brain_config",
+    "CognizeTool", "InstructTool",
     "Brain", "FileNeuron", "build_digests",
     "RLM", "RLMResult",
 ]
-
-# ── legacy heaven-based agent (optional; requires the 'heaven' extra) ─────────
-try:
-    from .brain_agent import BrainAgent, register_brain, get_brain_config
-    from .tools import CognizeTool, InstructTool
-    from .query_brain_tool import QueryBrainTool
-    from .replicants import SynthesizerReplicant, BrainAgentReplicant
-    from .manager_tools import BrainManagerTool, ModesAndPersonasManagerTool
-    __all__ += [
-        "BrainAgent", "register_brain", "get_brain_config",
-        "CognizeTool", "InstructTool", "QueryBrainTool",
-        "SynthesizerReplicant", "BrainAgentReplicant",
-        "BrainManagerTool", "ModesAndPersonasManagerTool",
-    ]
-except ImportError:
-    # heaven-framework not installed — the legacy agent is unavailable, but the
-    # hierarchical/RLM/server layer works fine without it.
-    pass

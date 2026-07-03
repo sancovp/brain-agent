@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "brain-agent"
-version = "0.3.1"
+version = "0.4.0"
 description = "Cognitive processing system for HEAVEN - Handles knowledge synthesis across any corpus size"
 readme = "README.md"
 authors = [
@@ -23,15 +23,13 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "anthropic>=0.40",
+    "heaven-framework>=0.1.30",
+    "langchain-core",
     "fastapi>=0.100",
     "uvicorn>=0.23",
 ]
 
 [project.optional-dependencies]
-heaven = [
-    "heaven-framework>=0.1.0",
-]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",

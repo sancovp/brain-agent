@@ -1,204 +1,72 @@
-"""brain-agent HTTP server — judge, fill, and RLM sessions.
+"""brain-agent HTTP server — judge, fill, and RLM sessions, on HEAVEN.
 
 The contract:
   The CALLER owns addressing — it knows which parts/cells exist and which
   slots are empty (zero-able). This server owns judgment and generation:
-    /judge — one neuron per part: part x rule -> verdict + VERBATIM witness
-    /fill  — generative spectrum completion, optionally brain-grounded
-    /rlm/* — stateful growing-corpus sessions (ingest / query / judge / flush)
+    /judge  — one heaven neuron per part: part x rule -> verdict + VERBATIM witness
+    /fill   — generative spectrum completion, optionally brain-grounded
+    /rlm/*  — stateful growing-corpus sessions (ingest / query / judge / flush)
   Plus the brain primitives: /brains/build, /brains/query, /neuron/*.
+
+Every LLM call goes through heaven (UnifiedChat) via the hierarchical primitives.
 
 Run:  brain-agent-http     (or: python -m brain_agent.hierarchical_server)
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from langchain_core.messages import SystemMessage, HumanMessage
 
 from . import hierarchical as hbrain
-from .hierarchical import (Brain, FileNeuron, Usage, USAGE_VAR, TRACE_VAR,
-                    get_trace, get_usage, _llm, _parse_vote, build_digests)
+from .hierarchical import (Brain, USAGE_VAR, TRACE_VAR, Usage, build_digests,
+                           get_trace, _neuron_messages, _batch, _plain,
+                           _content, _score, COGNIZE_SYSTEM, INSTRUCT_SYSTEM)
+from .rlm import RLM, JUDGE_SYSTEM
 
-app = FastAPI(title="hbrain", version="0.1.0")
+app = FastAPI(title="brain-agent", version="0.4.0")
 
 
-def _fresh() -> None:
-    USAGE_VAR.set(Usage())
+def _fresh() -> Usage:
+    u = Usage()
+    USAGE_VAR.set(u)
     TRACE_VAR.set([])
+    return u
 
 
-def _usage() -> dict:
-    u = get_usage()
-    return {"calls": u.calls, "input_tokens": u.input_tokens,
-            "output_tokens": u.output_tokens, "model": hbrain.MODEL}
+def _usage(u: Usage) -> dict:
+    return {"calls": u.calls, "model": hbrain.MODEL}
 
 
-# ── JUDGE mode: part × rule → verdict + verbatim witness ─────────────────────
-
-JUDGE_SYSTEM = (
-    "You are a JudgeNeuron. Judge the relationship between your neuron content "
-    "(one PART of a larger system) and the RULE in the user message.\n"
-    "Respond with a JSON object, keys:\n"
-    "  'verdict': one of 'complies' | 'violates' | 'not_applicable'\n"
-    "  'score': integer 0-10 confidence in the verdict\n"
-    "  'witness': a VERBATIM quote from your neuron content that evidences the "
-    "verdict (empty string ONLY for not_applicable)\n"
-    "  'reasoning': one or two sentences\n"
-    "RULES OF JUDGMENT: a verdict of complies/violates REQUIRES a verbatim "
-    "witness quote — no witness, no verdict (use not_applicable). Never invent "
-    "or paraphrase quotes. Judge ONLY against the given rule, not general "
-    "quality.\n\n<neuron content>\n{content}\n</neuron content>")
-
-
-def _parse_judgment(raw: str) -> dict:
+def _first_json(raw: str):
     start = raw.find("{")
-    if start != -1:
-        depth = 0
-        for i, ch in enumerate(raw[start:], start):
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        d = json.loads(raw[start:i + 1])
-                        verdict = str(d.get("verdict", "not_applicable"))
-                        if verdict not in ("complies", "violates", "not_applicable"):
-                            verdict = "not_applicable"
-                        witness = str(d.get("witness", ""))
-                        if verdict != "not_applicable" and not witness.strip():
-                            verdict = "not_applicable"  # no witness, no verdict
-                        return {"verdict": verdict,
-                                "score": max(0, min(10, int(d.get("score", 0)))),
-                                "witness": witness,
-                                "reasoning": str(d.get("reasoning", ""))}
-                    except (json.JSONDecodeError, ValueError, TypeError):
-                        break
-    return {"verdict": "not_applicable", "score": 0, "witness": "",
-            "reasoning": f"unparseable judgment: {raw[:100]}"}
+    if start == -1:
+        return None
+    depth = 0
+    for i, ch in enumerate(raw[start:], start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(raw[start:i + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
 
 
-class Part(BaseModel):
-    id: str
-    path: Optional[str] = None      # read content from disk
-    content: Optional[str] = None   # or inline
+# ── health / brain primitives ────────────────────────────────────────────────
 
+@app.get("/health")
+async def health() -> dict:
+    return {"ok": True, "model": hbrain.MODEL}
 
-class JudgeReq(BaseModel):
-    parts: list[Part]
-    rule: str
-
-
-@app.post("/judge")
-async def judge(req: JudgeReq) -> dict:
-    """Exhaustive judge mode: EVERY part judged against the rule. No descent,
-    no skipping — coverage by construction. Returns one row per part
-    (the incidence-matrix row for this rule)."""
-    _fresh()
-
-    async def one(p: Part) -> dict:
-        content = p.content if p.content is not None else Path(p.path).read_text(errors="replace")
-        raw = await _llm(JUDGE_SYSTEM.format(content=content),
-                         f"RULE: {req.rule}", 2500)
-        j = _parse_judgment(raw)
-        # witness must actually appear in the content — checkable, not vibes
-        if j["witness"] and j["witness"] not in content:
-            j["witness_verified"] = False
-        else:
-            j["witness_verified"] = bool(j["witness"])
-        return {"id": p.id, **j}
-
-    cells = await asyncio.gather(*(one(p) for p in req.parts))
-    verdicts = [c["verdict"] for c in cells]
-    return {
-        "rule": req.rule,
-        "cells": list(cells),
-        "summary": {
-            "parts": len(cells),
-            "complies": verdicts.count("complies"),
-            "violates": verdicts.count("violates"),
-            "not_applicable": verdicts.count("not_applicable"),
-            # the global-section indicator (CB side: kernelSanctuaryDegree lane)
-            "global_section": verdicts.count("violates") == 0,
-        },
-        "usage": _usage(),
-    }
-
-
-# ── FILL mode: generative completion for a zero/empty spectrum slot ─────────
-
-FILL_SYSTEM = (
-    "You are a SpectrumFiller for a coordinate engine. A node's children ARE "
-    "its spectrum — the set of choices at that slot. A spectrum needs at least "
-    "a high and a low, and its members must be mutually exclusive alternatives "
-    "at the SAME level of abstraction as the existing siblings.\n"
-    "Respond with a JSON object, key 'candidates': a list of objects with keys "
-    "'label' (short, concrete), 'rationale' (one sentence), 'confidence' "
-    "(0-10 integer). Propose exactly the requested number. No prose outside "
-    "the JSON.")
-
-
-class FillReq(BaseModel):
-    slot_label: str                      # the node whose spectrum needs filling
-    parent_label: Optional[str] = None
-    siblings: list[str] = []             # existing children (may be empty)
-    space_context: Optional[str] = None  # scry readout / kernel context from CB
-    n: int = 3
-    brain_root: Optional[str] = None     # ground the fill in a brain corpus
-
-
-@app.post("/fill")
-async def fill(req: FillReq) -> dict:
-    """Generative fill for a Born-0 / empty slot. If brain_root is given, a
-    brain query runs first and its witnessed synthesis grounds the proposals."""
-    _fresh()
-    grounding = ""
-    if req.brain_root:
-        root = Path(req.brain_root)
-        if not root.is_dir():
-            raise HTTPException(400, f"brain_root not found: {root}")
-        q = (f"What is known about '{req.slot_label}'"
-             + (f" in the context of '{req.parent_label}'" if req.parent_label else "")
-             + "? Collect concrete facts, names, and distinctions useful for "
-               "enumerating its variants.")
-        grounding = await Brain(root).query(q)
-
-    user = (f"SLOT: {req.slot_label}\n"
-            + (f"PARENT: {req.parent_label}\n" if req.parent_label else "")
-            + (f"EXISTING SIBLINGS: {', '.join(req.siblings)}\n" if req.siblings else "")
-            + (f"SPACE CONTEXT:\n{req.space_context}\n" if req.space_context else "")
-            + (f"GROUNDING (witnessed synthesis from the brain corpus):\n{grounding}\n"
-               if grounding and "NOT_FOUND" not in grounding[:60] else "")
-            + f"\nPropose {req.n} candidates for this spectrum.")
-    raw = await _llm(FILL_SYSTEM, user, 3000)
-
-    start = raw.find("{")
-    candidates: list[dict] = []
-    if start != -1:
-        try:
-            end = raw.rindex("}")
-            data = json.loads(raw[start:end + 1])
-            for c in data.get("candidates", [])[:req.n]:
-                candidates.append({
-                    "label": str(c.get("label", ""))[:120],
-                    "rationale": str(c.get("rationale", "")),
-                    "confidence": max(0, min(10, int(c.get("confidence", 0)))),
-                })
-        except (json.JSONDecodeError, ValueError, TypeError):
-            pass
-    return {"slot": req.slot_label, "candidates": candidates,
-            "grounded": bool(grounding and "NOT_FOUND" not in grounding[:60]),
-            "grounding": grounding if grounding else None,
-            "usage": _usage()}
-
-
-# ── Brain primitives ─────────────────────────────────────────────────────────
 
 class BuildReq(BaseModel):
     root: str
@@ -207,12 +75,12 @@ class BuildReq(BaseModel):
 
 @app.post("/brains/build")
 async def brains_build(req: BuildReq) -> dict:
-    _fresh()
+    u = _fresh()
     root = Path(req.root)
     if not root.is_dir():
         raise HTTPException(400, f"root not found: {root}")
     await build_digests(root, force=req.force)
-    return {"root": str(root), "built": True, "usage": _usage()}
+    return {"root": str(root), "built": True, "usage": _usage(u)}
 
 
 class QueryReq(BaseModel):
@@ -222,59 +90,149 @@ class QueryReq(BaseModel):
 
 @app.post("/brains/query")
 async def brains_query(req: QueryReq) -> dict:
-    _fresh()
+    u = _fresh()
     root = Path(req.root)
     if not root.is_dir():
         raise HTTPException(400, f"root not found: {root}")
     answer = await Brain(root).query(req.query)
-    return {"answer": answer, "trace": get_trace(), "usage": _usage()}
+    return {"answer": answer, "trace": get_trace(), "usage": _usage(u)}
 
 
 class NeuronReq(BaseModel):
     query: str
-    path: Optional[str] = None
-    content: Optional[str] = None
+    path: str
 
 
 @app.post("/neuron/cognize")
 async def neuron_cognize(req: NeuronReq) -> dict:
-    _fresh()
-    content = req.content if req.content is not None else Path(req.path).read_text(errors="replace")
-    raw = await _llm(hbrain.COGNIZE_SYSTEM.format(content=content),
-                     f"Query: {req.query}", 2500)
-    return {**_parse_vote(raw), "usage": _usage()}
+    u = _fresh()
+    resp = await _batch([_neuron_messages(req.path, req.query, COGNIZE_SYSTEM)],
+                        max_tokens=700)
+    return {**_score(_content(resp[0])), "usage": _usage(u)}
 
 
 @app.post("/neuron/instruct")
 async def neuron_instruct(req: NeuronReq) -> dict:
-    _fresh()
-    content = req.content if req.content is not None else Path(req.path).read_text(errors="replace")
-    out = await _llm(hbrain.INSTRUCT_SYSTEM.format(content=content),
-                     f"Query: {req.query}", 3000)
+    u = _fresh()
+    resp = await _batch([_neuron_messages(req.path, req.query, INSTRUCT_SYSTEM)],
+                        max_tokens=3000)
+    out = _content(resp[0]) if resp else "NOT_FOUND"
     return {"instructions": out, "not_found": "NOT_FOUND" in out[:200],
-            "usage": _usage()}
+            "usage": _usage(u)}
 
 
-@app.get("/health")
-async def health() -> dict:
-    return {"ok": True, "model": hbrain.MODEL}
+# ── JUDGE: exhaustive part × rule incidence row ──────────────────────────────
+
+class Part(BaseModel):
+    id: str
+    path: Optional[str] = None
+    content: Optional[str] = None
 
 
-def main() -> None:
-    import uvicorn
-    uvicorn.run(app, host=os.environ.get("HBRAIN_HOST", "127.0.0.1"),
-                port=int(os.environ.get("HBRAIN_PORT", "8177")))
+class JudgeReq(BaseModel):
+    parts: list[Part]
+    rule: str
 
 
-if __name__ == "__main__":
-    main()
+def _judge_messages(part: Part, rule: str) -> list:
+    """Render a part for judgment the heaven way (path= block) or inline."""
+    if part.path:
+        return _neuron_messages(part.path, rule, JUDGE_SYSTEM)
+    body = (JUDGE_SYSTEM + "\n\n<neuron content>\n" + (part.content or "")
+            + "\n</neuron content>")
+    return [SystemMessage(content=body), HumanMessage(content=f"RULE: {rule}")]
 
 
-# ── RLM: stateful growing-corpus sessions over the stateless brain ───────────
+@app.post("/judge")
+async def judge(req: JudgeReq) -> dict:
+    """Exhaustive judge mode: EVERY part judged, none skipped — coverage by
+    construction. One heaven neuron call per part; the incidence-matrix row."""
+    u = _fresh()
+    responses = await _batch([_judge_messages(p, req.rule) for p in req.parts],
+                             max_tokens=2500)
+    cells = []
+    for p, resp in zip(req.parts, responses):
+        content = (p.content if p.content is not None
+                   else Path(p.path).read_text(errors="replace") if p.path else "")
+        d = _first_json(_content(resp)) or {}
+        verdict = d.get("verdict", "not_applicable")
+        witness = str(d.get("witness", ""))
+        if verdict not in ("complies", "violates", "not_applicable"):
+            verdict = "not_applicable"
+        if verdict != "not_applicable" and not witness.strip():
+            verdict = "not_applicable"
+        cells.append({"id": p.id, "verdict": verdict,
+                      "score": _score(_content(resp))["score"], "witness": witness,
+                      "witness_verified": bool(witness) and witness in content,
+                      "reasoning": str(d.get("reasoning", ""))})
+    verdicts = [c["verdict"] for c in cells]
+    return {"rule": req.rule, "cells": cells,
+            "summary": {"parts": len(cells),
+                        "complies": verdicts.count("complies"),
+                        "violates": verdicts.count("violates"),
+                        "not_applicable": verdicts.count("not_applicable"),
+                        "global_section": verdicts.count("violates") == 0},
+            "usage": _usage(u)}
 
-from .rlm import RLM
 
-_rlms: dict[str, RLM] = {}
+# ── FILL: generative completion for an empty spectrum slot ────────────────────
+
+FILL_SYSTEM = (
+    "You are a SpectrumFiller for a coordinate engine. A node's children ARE its "
+    "spectrum — the set of choices at that slot. A spectrum needs at least a high "
+    "and a low, and its members must be mutually exclusive alternatives at the "
+    "SAME level of abstraction as the existing siblings. Respond with a JSON "
+    "object, key 'candidates': a list of objects with keys 'label' (short, "
+    "concrete), 'rationale' (one sentence), 'confidence' (0-10 integer). Propose "
+    "exactly the requested number. No prose outside the JSON.")
+
+
+class FillReq(BaseModel):
+    slot_label: str
+    parent_label: Optional[str] = None
+    siblings: list[str] = []
+    space_context: Optional[str] = None
+    n: int = 3
+    brain_root: Optional[str] = None
+
+
+@app.post("/fill")
+async def fill(req: FillReq) -> dict:
+    u = _fresh()
+    grounding = ""
+    if req.brain_root:
+        root = Path(req.brain_root)
+        if not root.is_dir():
+            raise HTTPException(400, f"brain_root not found: {root}")
+        grounding = await Brain(root).query(
+            f"What is known about '{req.slot_label}'"
+            + (f" in the context of '{req.parent_label}'" if req.parent_label else "")
+            + "? Collect concrete facts, names, and distinctions useful for "
+              "enumerating its variants.")
+    grounded = bool(grounding and "NOT_FOUND" not in grounding[:60])
+    user = (f"SLOT: {req.slot_label}\n"
+            + (f"PARENT: {req.parent_label}\n" if req.parent_label else "")
+            + (f"EXISTING SIBLINGS: {', '.join(req.siblings)}\n" if req.siblings else "")
+            + (f"SPACE CONTEXT:\n{req.space_context}\n" if req.space_context else "")
+            + (f"GROUNDING (witnessed synthesis):\n{grounding}\n" if grounded else "")
+            + f"\nPropose {req.n} candidates for this spectrum.")
+    raw = await _plain(FILL_SYSTEM, user, max_tokens=3000)
+    data = _first_json(raw) or {}
+    cands = []
+    for c in (data.get("candidates", []) or [])[:req.n]:
+        try:
+            cands.append({"label": str(c.get("label", ""))[:120],
+                          "rationale": str(c.get("rationale", "")),
+                          "confidence": max(0, min(10, int(c.get("confidence", 0))))})
+        except (ValueError, TypeError):
+            continue
+    return {"slot": req.slot_label, "candidates": cands, "grounded": grounded,
+            "grounding": grounding or None, "usage": _usage(u)}
+
+
+# ── RLM: stateful growing-corpus sessions ────────────────────────────────────
+
+_rlms: dict = {}
 
 
 def _rlm(root: str, session: Optional[str]) -> RLM:
@@ -307,8 +265,7 @@ class RLMQueryReq(BaseModel):
 
 @app.post("/rlm/query")
 async def rlm_query(req: RLMQueryReq) -> dict:
-    r = _rlm(req.root, req.session)
-    res = await r.query(req.goal)
+    res = await _rlm(req.root, req.session).query(req.goal)
     return {"answer": res.answer, "refs": res.refs, "usage": res.usage}
 
 
@@ -323,9 +280,24 @@ async def rlm_judge(req: RLMJudgeReq) -> dict:
     return await _rlm(req.root, req.session).judge(req.rule)
 
 
+class RLMFlushReq(BaseModel):
+    root: str
+    session: Optional[str] = None
+
+
 @app.post("/rlm/flush")
-async def rlm_flush(req: RLMQueryReq) -> dict:
+async def rlm_flush(req: RLMFlushReq) -> dict:
     r = _rlm(req.root, req.session)
     path = r.flush()
     res = await r.reindex()
     return {"flushed": str(path) if path else None, **res}
+
+
+def main() -> None:
+    import uvicorn
+    uvicorn.run(app, host=os.environ.get("HBRAIN_HOST", "127.0.0.1"),
+                port=int(os.environ.get("HBRAIN_PORT", "8177")))
+
+
+if __name__ == "__main__":
+    main()

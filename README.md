@@ -82,9 +82,11 @@ the server owns judgment and generation.
 - `POST /brains/build`, `POST /brains/query`, `POST /neuron/cognize`,
   `POST /neuron/instruct`, `GET /health`.
 
-Models: any Anthropic-compatible endpoint (`HBRAIN_MODEL`, default
-`MiniMax-M2.7-highspeed` via `MINIMAX_API_KEY`; Claude models via
-`ANTHROPIC_API_KEY`).
+Runs entirely on **heaven** (`UnifiedChat` + `HeavenAgentConfig`) — heaven owns
+model routing and auth, exactly as `brain_agent/tools.py` does. Model is
+`HBRAIN_MODEL` (default `MiniMax-M2.7-highspeed`, provider `HBRAIN_PROVIDER`,
+default `ANTHROPIC` — heaven auto-routes MiniMax-\* to `MINIMAX_API_KEY`). No raw
+provider SDK.
 
 ## RLM — Recursive Language Model (v0.3.0)
 
