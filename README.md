@@ -50,3 +50,38 @@ result = await agent.query("brain=my_knowledge_base query=What is machine learni
 ## License
 
 Private - All rights reserved.
+## Hierarchical Brains (v0.2.0)
+
+Brains whose neurons are brains. A `Brain` implements the same 2-stage Neuron
+protocol its own neurons use — **cognize** (cheap relevance vote off the brain's
+`_digest.md`) and **instruct** (a full recursive cognize→instruct→synthesize
+pass) — so hierarchies nest to arbitrary depth. Digests build bottom-up
+(`build_digests`): the level touching raw files gets an LLM fold; levels above
+concatenate child digests verbatim, so distinctive vocabulary survives to the
+root.
+
+```python
+from brain_agent.hierarchical import Brain, build_digests
+await build_digests(Path("corpus"))            # the pyramid is just directories
+answer = await Brain(Path("corpus")).query("...")
+```
+
+## HTTP server (judge + fill)
+
+`brain-agent-http` serves the brain over HTTP for coordinate/configuration
+engines: the caller owns addressing (which parts exist, which slots are empty);
+the server owns judgment and generation.
+
+- `POST /judge` — {parts, rule} → one verdict per part (complies / violates /
+  not_applicable) with a **verbatim witness quote**, machine-verified to appear
+  in the source (`witness_verified`). Exhaustive: every part judged, none
+  skipped. Returns a `global_section` flag (no violations anywhere).
+- `POST /fill` — {slot_label, siblings, n, brain_root?} → candidate spectrum
+  completions; if `brain_root` is given the proposals are grounded in a
+  witnessed brain synthesis (`grounded` flag reports honestly).
+- `POST /brains/build`, `POST /brains/query`, `POST /neuron/cognize`,
+  `POST /neuron/instruct`, `GET /health`.
+
+Models: any Anthropic-compatible endpoint (`HBRAIN_MODEL`, default
+`MiniMax-M2.7-highspeed` via `MINIMAX_API_KEY`; Claude models via
+`ANTHROPIC_API_KEY`).

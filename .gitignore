@@ -39,4 +39,10 @@ htmlcov/
 # mypy
 .mypy_cache/
 .dmypy.json
-dmypy.json
+dmypy.json.claude/
+starlog.hpi
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/

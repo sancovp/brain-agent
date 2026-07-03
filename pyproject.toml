@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "brain-agent"
-version = "0.1.4"
+version = "0.2.0"
 description = "Cognitive processing system for HEAVEN - Handles knowledge synthesis across any corpus size"
 readme = "README.md"
 authors = [
@@ -24,6 +24,9 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = [
     "heaven-framework>=0.1.0",
+    "anthropic>=0.40",
+    "fastapi>=0.100",
+    "uvicorn>=0.23",
 ]
 
 [project.optional-dependencies]
@@ -36,6 +39,7 @@ dev = [
 
 [project.scripts]
 brain-agent-server = "brain_agent.brain_agent_mcp:main"
+brain-agent-http = "brain_agent.hierarchical_server:main"
 
 [project.urls]
 Homepage = "https://github.com/sancovp/brain-agent"
