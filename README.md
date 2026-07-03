@@ -85,3 +85,28 @@ the server owns judgment and generation.
 Models: any Anthropic-compatible endpoint (`HBRAIN_MODEL`, default
 `MiniMax-M2.7-highspeed` via `MINIMAX_API_KEY`; Claude models via
 `ANTHROPIC_API_KEY`).
+
+## RLM — Recursive Language Model (v0.3.0)
+
+`RLM` owns a GROWING corpus end-to-end: live ingestion, incremental pyramid
+maintenance, and query/judge over unbounded context. The context window is
+replaced by a filesystem pyramid — each LLM call sees O(node) tokens while the
+corpus is unbounded.
+
+```python
+from brain_agent.rlm import RLM
+
+r = RLM("corpus_root", session="my_session")
+r.ingest_message("user", "...")        # boundary rule: user text starts an iteration
+r.ingest_message("assistant", "...")
+await r.reindex()                        # folds ONLY dirty branches — O(changed)
+res = await r.query("...")              # witnessed synthesis + descent refs
+report = await r.judge("<rule>")        # exhaustive incidence row over all parts
+```
+
+HTTP: `/rlm/ingest`, `/rlm/query`, `/rlm/judge`, `/rlm/flush` (stateful
+sessions keyed by root+session on the same `brain-agent-http` server).
+
+Verified on a real 329-message agent transcript: 22 iterations / 3 phases
+auto-folded, incremental growth re-folds exactly the dirty branch, needle
+query answered with a verbatim source-cited quote.

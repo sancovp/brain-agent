@@ -1,18 +1,14 @@
-"""brain-agent HTTP server — judge and fill for coordinate/configuration engines.
+"""brain-agent HTTP server — judge, fill, and RLM sessions.
 
 The contract:
   The CALLER owns addressing — it knows which parts/cells exist and which
-  slots are empty (zero-able). This server owns two verbs against them:
+  slots are empty (zero-able). This server owns judgment and generation:
     /judge — one neuron per part: part x rule -> verdict + VERBATIM witness
-             (exhaustive: every part sent gets judged, none skipped)
-    /fill  — generative: propose completions for an empty spectrum slot,
-             optionally GROUNDED in a hierarchical brain corpus
+    /fill  — generative spectrum completion, optionally brain-grounded
+    /rlm/* — stateful growing-corpus sessions (ingest / query / judge / flush)
   Plus the brain primitives: /brains/build, /brains/query, /neuron/*.
 
-Stateless per call (digests persist on disk next to the corpus).
-
-Run:  brain-agent-http            (console script)
-      HBRAIN_PORT=8177 python -m brain_agent.hierarchical_server
+Run:  brain-agent-http     (or: python -m brain_agent.hierarchical_server)
 """
 from __future__ import annotations
 
@@ -272,3 +268,64 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# ── RLM: stateful growing-corpus sessions over the stateless brain ───────────
+
+from .rlm import RLM
+
+_rlms: dict[str, RLM] = {}
+
+
+def _rlm(root: str, session: Optional[str]) -> RLM:
+    key = f"{root}::{session or 'session_default'}"
+    if key not in _rlms:
+        _rlms[key] = RLM(root, session=session or "session_default")
+    return _rlms[key]
+
+
+class RLMIngestReq(BaseModel):
+    root: str
+    session: Optional[str] = None
+    role: str
+    text: str
+    tools: list[str] = []
+
+
+@app.post("/rlm/ingest")
+async def rlm_ingest(req: RLMIngestReq) -> dict:
+    r = _rlm(req.root, req.session)
+    r.ingest_message(req.role, req.text, req.tools)
+    return {"ok": True, "session": r.session, "iterations": r._n}
+
+
+class RLMQueryReq(BaseModel):
+    root: str
+    session: Optional[str] = None
+    goal: str
+
+
+@app.post("/rlm/query")
+async def rlm_query(req: RLMQueryReq) -> dict:
+    r = _rlm(req.root, req.session)
+    res = await r.query(req.goal)
+    return {"answer": res.answer, "refs": res.refs, "usage": res.usage}
+
+
+class RLMJudgeReq(BaseModel):
+    root: str
+    session: Optional[str] = None
+    rule: str
+
+
+@app.post("/rlm/judge")
+async def rlm_judge(req: RLMJudgeReq) -> dict:
+    return await _rlm(req.root, req.session).judge(req.rule)
+
+
+@app.post("/rlm/flush")
+async def rlm_flush(req: RLMQueryReq) -> dict:
+    r = _rlm(req.root, req.session)
+    path = r.flush()
+    res = await r.reindex()
+    return {"flushed": str(path) if path else None, **res}
