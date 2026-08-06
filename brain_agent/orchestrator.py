@@ -41,18 +41,20 @@ UNBOUNDED_TOOL_CALLS = int(os.environ.get("BRAIN_MAX_TOOL_CALLS", "1000"))
 # variable — truncation here bounds the model's context, never its data.
 TOOL_OUTPUT_LIMIT = 4000
 
-_CURRENT_KERNEL = "rlm"
+import contextvars
+
+_CURRENT_KERNEL: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "brain_current_kernel", default="rlm")
 
 
 def set_current_kernel(name: str) -> None:
-    global _CURRENT_KERNEL
-    _CURRENT_KERNEL = name
+    _CURRENT_KERNEL.set(name)
 
 
 async def shell_func(code: str, kernel: Optional[str] = None) -> str:
     """Execute code in the persistent runtime context and return its stdout."""
     from .kernel import Kernel
-    k = Kernel(kernel or _CURRENT_KERNEL)
+    k = Kernel(kernel or _CURRENT_KERNEL.get())
     k.start()
     # Span the tool call itself: moving from a scraped-cell loop to a real tool
     # otherwise drops every cell from the call graph, which is exactly the
@@ -109,8 +111,67 @@ import brain_agent.trace as trace
 from brain_agent.sdk import (Neuron, Synthesizer, Brain, fanout, sub_llm,
                              from_dir, open_all_router, top_k_router,
                              threshold_router)
-"""
+# The hierarchical digest-pyramid brain, under its own name (its class is also
+# called Brain, which is why importing it raw would shadow the composable one).
+from brain_agent.hierarchical import Brain as DigestBrain
+from brain_agent.hierarchical import build_digests as build_digests
 
+# existing brains: the brain_configs registry the original BrainAgent uses
+
+def _brain_registry():
+    # Read the registry FILE. This heaven version formats every registry_util
+    # operation (get and get_all alike) into a display string, so the on-disk
+    # JSON is the only machine-readable surface.
+    import json, os
+    from heaven_base.utils.get_env_value import EnvConfigUtil
+    path = os.path.join(EnvConfigUtil.get_heaven_data_dir(), "registry",
+                        "brain_configs_registry.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def list_brains():
+    "Names of every registered brain."
+    return sorted(_brain_registry())
+
+def load_brain(name, router=None):
+    "A REGISTERED brain as a composable Brain value (usable as a neuron)."
+    import os
+    entries = _brain_registry()
+    if name not in entries:
+        raise KeyError(f"brain {name!r} not registered; see list_brains()")
+    cfg = entries[name]
+    cfg = cfg.get("value_dict", cfg) if isinstance(cfg, dict) else cfg
+    src = cfg.get("neuron_source") or cfg.get("directory")
+    if not os.path.isabs(src):
+        from heaven_base.utils.get_env_value import EnvConfigUtil
+        src = os.path.join(EnvConfigUtil.get_heaven_data_dir(), src)
+    return from_dir(src, router=router, name=name)
+
+def register_brain(directory, brain_name, chunk_size=-1):
+    from brain_agent.brain_agent import register_brain as _rb
+    return _rb(directory, brain_name, chunk_size)
+
+# recursion: another synthesizer AGENT as a callable
+
+__sub_seq__ = [0]
+
+async def sub_rlm(task, bind=None, kernel=None):
+    "Delegate to ANOTHER synthesizer agent with its OWN runtime context. It"
+    "builds whatever brain systems it needs and returns its answer. bind is a"
+    "dict of values placed into its context by name. Children can call"
+    "sub_rlm themselves, so synthesizers stack as deep as the task needs."
+    from brain_agent.orchestrator import Orchestrator
+    __sub_seq__[0] += 1
+    name = kernel or f"{__kernel_name__}-sub{__sub_seq__[0]}"
+    with trace.span("sub_rlm", str(task)[:80], child_kernel=name):
+        child = Orchestrator(kernel=name)
+        if bind:
+            child.bind(**bind)
+        return await child.run(task)
+"""
 SYSTEM = """You are a synthesizer that builds and runs brain systems.
 
 You have ONE persistent runtime context, reached with ShellTool. Everything you
@@ -148,6 +209,25 @@ package exports a different, directory-based Brain that would shadow these):
   await gather(...)              run anything concurrently, including whole
                                  brains — as many at once as you want.
   from_dir(path)                 build a Brain from a directory tree.
+  list_brains() / load_brain(name)
+                                 the registry of EXISTING brains. load_brain
+                                 returns a Brain value: query it directly, or
+                                 stack it as a neuron inside a brain you build.
+  register_brain(directory, name)
+                                 register a directory as a reusable brain.
+  DigestBrain(Path(dir)) / await build_digests(Path(dir))
+                                 the hierarchical digest-pyramid brain for BIG
+                                 corpora: build_digests folds a directory tree
+                                 into _digest.md router faces once, then
+                                 DigestBrain(root).query(q) descends it with
+                                 witnessed synthesis. Prefer it over hand-made
+                                 neurons when the corpus is a large tree.
+  await sub_rlm(task, bind={...})
+                                 delegate to ANOTHER synthesizer agent with its
+                                 own runtime context; returns its answer. It can
+                                 build brains and call sub_rlm itself, so
+                                 synthesizers stack. Run several at once with
+                                 gather.
 
 How to work:
 
@@ -182,6 +262,7 @@ class Orchestrator:
             self.k.shutdown()
         self.k.start()
         set_current_kernel(self.kernel)
+        self.k.exec(f"__kernel_name__ = {self.kernel!r}")
         if "Neuron" not in self.k.vars():
             self.k.exec(BOOTSTRAP)
 
