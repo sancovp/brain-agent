@@ -17,10 +17,18 @@ from .tools import CognizeTool, InstructTool
 from .hierarchical import Brain, FileNeuron, build_digests
 from .rlm import RLM, RLMResult
 
+# ── the SDK + the shell (the agent composes brains at runtime, in Python) ─────
+from .sdk import (Neuron, Synthesizer, Brain as ComposedBrain, fanout, sub_llm,
+                  from_dir, open_all_router, top_k_router, threshold_router)
+from .shell import BrainShell, PyShell, default_policy
+
 __all__ = [
     "BrainConfig",
     "BrainAgent", "register_brain", "get_brain_config",
     "CognizeTool", "InstructTool",
     "Brain", "FileNeuron", "build_digests",
     "RLM", "RLMResult",
+    "Neuron", "Synthesizer", "ComposedBrain", "fanout", "sub_llm", "from_dir",
+    "open_all_router", "top_k_router", "threshold_router",
+    "BrainShell", "PyShell", "default_policy",
 ]

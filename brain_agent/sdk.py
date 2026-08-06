@@ -1,0 +1,224 @@
+"""The brain-agent SDK — the primitives a SHELL AGENT composes at runtime.
+
+This is the layer `shell.py` preloads into the agent's REPL. Everything here is
+a plain Python object the agent can construct, inspect, subclass, put in a list,
+loop over, and call. Nothing walks a directory unless the agent asks it to.
+
+  Neuron       one context chunk + one prompt. Callable.
+  Synthesizer  one prompt that folds N neuron outputs into one answer. Callable.
+  Brain        N neurons + 1 synthesizer + a ROUTER the agent supplies. Callable.
+               A Brain is itself usable as a neuron → hierarchies nest.
+  fanout()     the raw N-parallel-neuron primitive (one heaven abatch).
+  from_dir()   adapter: build a Brain out of a directory (the old behavior,
+               now just one constructor among many).
+
+The router is a plain callable `(query, votes, neurons) -> list[index]`. The old
+hardcoded top-k lives in `top_k_router` as a DEFAULT, not as the mechanism —
+the agent is free to write its own in the shell, which is the point.
+
+All LLM calls go through heaven (`hierarchical._batch`) exactly as before.
+"""
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Optional, Sequence, Union
+
+from langchain_core.messages import SystemMessage, HumanMessage
+
+from .hierarchical import (
+    COGNIZE_SYSTEM, INSTRUCT_SYSTEM, BRAIN_COGNIZE_SYSTEM,
+    _batch, _content, _score, _neuron_messages,
+)
+
+Content = Union[str, Path]
+
+DEFAULT_SYNTH_PROMPT = (
+    "You are a Brain synthesizer. Combine the instruction blocks into one "
+    "coherent answer to the query. Every claim must trace to a verbatim quote "
+    "in the blocks; cite the source for each fact; never add information not "
+    "present in the blocks. If the blocks do not answer the query, say NOT_FOUND.")
+
+
+def _messages(content: Content, query: str, system: str) -> list:
+    """Render one neuron call. A Path goes through heaven's path= block (so file
+    handling stays identical to tools.py); a str is inlined directly."""
+    if isinstance(content, Path):
+        return _neuron_messages(str(content), query, system)
+    return [SystemMessage(content=f"{system}\n\n<neuron content>\n{content}\n</neuron content>"),
+            HumanMessage(content=f"Query: {query}")]
+
+
+# ── the three primitives ─────────────────────────────────────────────────────
+
+@dataclass
+class Neuron:
+    """One chunk of context + one prompt. The atom."""
+    content: Content
+    name: str = "neuron"
+    prompt: str = INSTRUCT_SYSTEM
+    cognize_prompt: str = COGNIZE_SYSTEM
+
+    def instruct_msgs(self, query: str) -> list:
+        return _messages(self.content, query, self.prompt)
+
+    def cognize_msgs(self, query: str) -> list:
+        return _messages(self.content, query, self.cognize_prompt)
+
+    async def instruct(self, query: str, *, max_tokens: int = 3000) -> str:
+        resp = await _batch([self.instruct_msgs(query)], max_tokens=max_tokens)
+        return _content(resp[0]) if resp else "NOT_FOUND"
+
+    async def cognize(self, query: str) -> dict:
+        resp = await _batch([self.cognize_msgs(query)], max_tokens=700)
+        return _score(_content(resp[0])) if resp else {"score": 0, "reasoning": "no response"}
+
+    async def __call__(self, query: str, **kw) -> str:
+        return await self.instruct(query, **kw)
+
+
+@dataclass
+class Synthesizer:
+    """Folds N (name, text) blocks into one answer."""
+    prompt: str = DEFAULT_SYNTH_PROMPT
+    name: str = "synthesizer"
+    max_tokens: int = 4000
+
+    async def __call__(self, query: str, parts: Sequence[tuple]) -> str:
+        blocks = "\n\n".join(f"<from source='{n}'>\n{t}\n</from>" for n, t in parts)
+        resp = await _batch([[SystemMessage(content=self.prompt),
+                              HumanMessage(content=f"Query: {query}\n\n{blocks}")]],
+                            max_tokens=self.max_tokens)
+        return _content(resp[0]) if resp else "NOT_FOUND"
+
+
+# ── routers (plain callables — write your own in the shell) ──────────────────
+
+def open_all_router(query, votes, neurons) -> list:
+    """Open every neuron. Correct and expensive; the honest default for small N."""
+    return list(range(len(neurons)))
+
+
+def top_k_router(k: int = 2, threshold: int = 6, always_argmax: bool = True) -> Callable:
+    """The previous hardcoded behavior, now an explicit, replaceable choice."""
+    def route(query, votes, neurons) -> list:
+        order = sorted(range(len(neurons)), key=lambda i: votes[i]["score"], reverse=True)
+        chosen = {i for i in order[:k] if votes[i]["score"] > 0}
+        chosen |= {i for i in range(len(neurons)) if votes[i]["score"] >= threshold}
+        if always_argmax and order:
+            chosen.add(order[0])
+        return sorted(chosen)
+    return route
+
+
+def threshold_router(threshold: int = 6) -> Callable:
+    def route(query, votes, neurons) -> list:
+        return [i for i in range(len(neurons)) if votes[i]["score"] >= threshold]
+    return route
+
+
+# ── the composable brain ─────────────────────────────────────────────────────
+
+@dataclass
+class Brain:
+    """N neurons + 1 synthesizer + a router. Callable, and usable AS a neuron.
+
+    `neurons` may contain Neurons or other Brains — that is the hierarchy, and
+    it is built by the agent in the shell, not inferred from a directory.
+    """
+    neurons: list = field(default_factory=list)
+    synthesizer: Synthesizer = field(default_factory=Synthesizer)
+    name: str = "brain"
+    router: Callable = field(default=open_all_router)
+    digest: Optional[Content] = None      # this brain's neuron-face for a parent
+    trace: list = field(default_factory=list)
+
+    # ── as a NEURON (what a parent scores) ──
+    def cognize_msgs(self, query: str) -> list:
+        face = self.digest if self.digest is not None else f"brain '{self.name}' with {len(self.neurons)} neurons"
+        return _messages(face, query, BRAIN_COGNIZE_SYSTEM)
+
+    async def cognize(self, query: str) -> dict:
+        resp = await _batch([self.cognize_msgs(query)], max_tokens=700)
+        return _score(_content(resp[0])) if resp else {"score": 0, "reasoning": "no response"}
+
+    async def instruct(self, query: str, **kw) -> str:
+        return await self.query(query, **kw)
+
+    # ── as a BRAIN ──
+    async def vote(self, query: str) -> list:
+        """Stage 1: every neuron scores in ONE batch. Returns the raw votes so
+        the agent can route on them itself."""
+        if not self.neurons:
+            return []
+        resps = await _batch([n.cognize_msgs(query) for n in self.neurons], max_tokens=700)
+        return [_score(_content(r)) for r in resps]
+
+    async def query(self, query: str, *, router: Optional[Callable] = None,
+                    max_tokens: int = 3000) -> str:
+        if not self.neurons:
+            return f"NOT_FOUND (brain {self.name}: empty)"
+        votes = await self.vote(query)
+        chosen = (router or self.router)(query, votes, self.neurons)
+        self.trace = [{"name": getattr(n, "name", str(i)), "score": votes[i]["score"],
+                       "opened": i in set(chosen)} for i, n in enumerate(self.neurons)]
+        picked = [self.neurons[i] for i in chosen]
+        if not picked:
+            return f"NOT_FOUND (brain {self.name}: router opened nothing)"
+        flat = [n for n in picked if isinstance(n, Neuron)]
+        deep = [n for n in picked if not isinstance(n, Neuron)]
+        flat_out, deep_out = await asyncio.gather(
+            _batch([n.instruct_msgs(query) for n in flat], max_tokens=max_tokens),
+            asyncio.gather(*(b.instruct(query) for b in deep)),
+        )
+        parts = [(n.name, _content(r)) for n, r in zip(flat, flat_out)]
+        parts += [(getattr(b, "name", "sub"), o) for b, o in zip(deep, deep_out)]
+        parts = [(n, t) for n, t in parts if "NOT_FOUND" not in t[:200]]
+        if not parts:
+            return f"NOT_FOUND (brain {self.name}: opened neurons had no answer)"
+        return await self.synthesizer(query, parts)
+
+    async def __call__(self, query: str, **kw) -> str:
+        return await self.query(query, **kw)
+
+
+# ── the raw fan-out primitive ────────────────────────────────────────────────
+
+async def fanout(chunks: Sequence[Content], query: str, *,
+                 prompt: str = INSTRUCT_SYSTEM, max_tokens: int = 3000) -> list:
+    """N neurons, one batch, raw list of strings back. The thing to reach for
+    when you want N sub-calls and will fold them yourself."""
+    if not chunks:
+        return []
+    resps = await _batch([_messages(c, query, prompt) for c in chunks], max_tokens=max_tokens)
+    return [_content(r) for r in resps]
+
+
+async def sub_llm(prompt: str, content: Content = "", *, max_tokens: int = 3000) -> str:
+    """One sub-call. The simplest recursion step."""
+    out = await fanout([content], prompt, prompt=INSTRUCT_SYSTEM, max_tokens=max_tokens)
+    return out[0] if out else ""
+
+
+# ── adapters ─────────────────────────────────────────────────────────────────
+
+def from_dir(root: Union[str, Path], *, router: Optional[Callable] = None,
+             include: Optional[Callable] = None, name: Optional[str] = None) -> Brain:
+    """Build a Brain out of a directory tree — the old behavior, now an explicit
+    constructor the agent calls when it wants it. Sub-dirs become sub-Brains;
+    a `_digest.md` (if present) becomes that Brain's neuron-face."""
+    from .hierarchical import DIGEST_NAME, _should_include_file
+    root = Path(root)
+    keep = include or (lambda p: _should_include_file(str(p)))
+    kids: list = []
+    for p in sorted(root.iterdir()):
+        if p.name.startswith((".", "_")):
+            continue
+        if p.is_dir():
+            kids.append(from_dir(p, router=router, include=include))
+        elif p.is_file() and keep(p):
+            kids.append(Neuron(content=p, name=p.name))
+    dig = root / DIGEST_NAME
+    return Brain(neurons=kids, name=name or root.name, digest=dig if dig.exists() else None,
+                 router=router or top_k_router())
