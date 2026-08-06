@@ -177,3 +177,50 @@ Live (MiniMax-M2.7-highspeed via heaven): all ten SDK primitives; `sub_rlm`
 recursion onto a child kernel; and an end-to-end run over a 60,709-char corpus
 in which the model wrote seven cells, abandoned a first decomposition that
 produced 1,188 false positives, recovered, and returned the correct answer.
+
+## Call-graph tracing (v0.6.0)
+
+Every agent call is recorded as a node — root turns, cells, brains, votes,
+neurons, fanouts, sub-LLM calls, synthesizers, and `sub_rlm` delegations.
+Recording is off unless `BRAIN_TRACE_DIR` is set, and needs only the standard
+library; `networkx` is required only to *load* a graph (`pip install
+brain-agent[graph]`).
+
+```bash
+BRAIN_TRACE_DIR=/tmp/run1 python my_rlm_script.py
+python -m brain_agent.trace /tmp/run1
+```
+
+```
+root     Exactly one ledger entry is disputed. Which account,  10.51s
+  turn     turn 0                                                 4.39s
+  turn     turn 2                                                 2.69s
+  cell     import re                                              0.00s
+  cell     Final = {                                              0.00s
+```
+
+```python
+from brain_agent import load_run
+import networkx as nx
+G = load_run("/tmp/run1")
+nx.is_tree(G.to_undirected())        # True — one caller per call
+G.nodes["tr:4"]["elapsed_s"], G.nodes["tr:4"]["kind"]
+```
+
+The shape is a tree, but it is a DiGraph because it spans **processes**: a
+`sub_rlm` child runs in its own kernel and writes its own file. The parent's
+`sub_rlm` node carries the child's kernel name, and `load_run()` stitches on
+that edge (marked `cross_process=True`). Nesting inside a process is automatic
+via a contextvar, and the cell request carries the caller's span id so
+kernel-side work hangs under the client's tree rather than orphaning.
+
+Nodes carry `kind`, `label`, `elapsed_s`, `ok`/`error`, plus extras: a `vote`
+node records the scores it produced, a `brain` node how many neurons opened.
+
+### Parallelism
+
+- `fanout(chunks, q)` and `Brain.vote` issue **N model calls in one batch** —
+  measured 2.6× faster than the same six calls sequentially.
+- `Brain.query` runs opened files and sub-brains concurrently.
+- `sub_rlm` awaits its child, but `asyncio.gather` (exposed in the shell as
+  `gather`) runs several children at once — each on its **own** kernel.

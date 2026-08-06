@@ -32,6 +32,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from . import trace
 from .shell import PyShell, default_policy
 
 RUNTIME_DIR = Path(os.environ.get("BRAIN_KERNEL_DIR",
@@ -78,7 +79,14 @@ async def serve(name: str, policy=default_policy, idle_timeout: Optional[float] 
                 asyncio.get_running_loop().stop()
                 return
             else:
-                out = await shell.run(req.get("code", ""))
+                # Adopt the caller's span as this cell's parent so kernel-side
+                # spans (neurons, brains, fanouts) hang under the client's tree
+                # instead of orphaning in this process's file.
+                tok = trace._PARENT.set(req.get("parent"))
+                try:
+                    out = await shell.run(req.get("code", ""))
+                finally:
+                    trace._PARENT.reset(tok)
                 resp = {"ok": True, "stdout": out,
                         "vars": sorted(k for k in shell.ns if not k.startswith("__"))}
         except Exception as exc:                        # never kill the kernel
@@ -127,6 +135,9 @@ class Kernel:
             [sys.executable, "-m", "brain_agent.kernel", "start", "--name", self.name],
             stdout=log, stderr=log, stdin=subprocess.DEVNULL,
             start_new_session=True,      # survives the caller's process group
+            # so trace node ids are namespaced per kernel and the run's records
+            # from every process land in one directory
+            env={**os.environ, "BRAIN_KERNEL_SELF": self.name},
         )
         deadline = time.time() + wait
         while time.time() < deadline:
@@ -149,8 +160,9 @@ class Kernel:
                 chunks.append(b)
         return json.loads(b"".join(chunks).decode("utf-8"))
 
-    def exec(self, code: str, timeout: float = 300) -> str:
-        r = self._request({"op": "exec", "code": code}, timeout=timeout)
+    def exec(self, code: str, timeout: float = 300, parent: Optional[str] = None) -> str:
+        r = self._request({"op": "exec", "code": code,
+                           "parent": parent or trace.current_parent()}, timeout=timeout)
         if not r.get("ok"):
             return f"kernel error: {r.get('error')}"
         return r.get("stdout", "")

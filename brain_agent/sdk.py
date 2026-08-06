@@ -27,6 +27,7 @@ from typing import Any, Callable, Optional, Sequence, Union
 
 from langchain_core.messages import SystemMessage, HumanMessage
 
+from . import trace
 from .hierarchical import (
     COGNIZE_SYSTEM, INSTRUCT_SYSTEM, BRAIN_COGNIZE_SYSTEM,
     _batch, _content, _score, _neuron_messages,
@@ -67,8 +68,9 @@ class Neuron:
         return _messages(self.content, query, self.cognize_prompt)
 
     async def instruct(self, query: str, *, max_tokens: int = 3000) -> str:
-        resp = await _batch([self.instruct_msgs(query)], max_tokens=max_tokens)
-        return _content(resp[0]) if resp else "NOT_FOUND"
+        with trace.span("neuron", self.name):
+            resp = await _batch([self.instruct_msgs(query)], max_tokens=max_tokens)
+            return _content(resp[0]) if resp else "NOT_FOUND"
 
     async def cognize(self, query: str) -> dict:
         resp = await _batch([self.cognize_msgs(query)], max_tokens=700)
@@ -86,6 +88,7 @@ class Synthesizer:
     max_tokens: int = 4000
 
     async def __call__(self, query: str, parts: Sequence[tuple]) -> str:
+      with trace.span("synth", self.name, n=len(parts)):
         blocks = "\n\n".join(f"<from source='{n}'>\n{t}\n</from>" for n, t in parts)
         resp = await _batch([[SystemMessage(content=self.prompt),
                               HumanMessage(content=f"Query: {query}\n\n{blocks}")]],
@@ -152,32 +155,38 @@ class Brain:
         the agent can route on them itself."""
         if not self.neurons:
             return []
-        resps = await _batch([n.cognize_msgs(query) for n in self.neurons], max_tokens=700)
-        return [_score(_content(r)) for r in resps]
+        with trace.span("vote", self.name, n=len(self.neurons)) as sp:
+            resps = await _batch([n.cognize_msgs(query) for n in self.neurons],
+                                 max_tokens=700)
+            votes = [_score(_content(r)) for r in resps]
+            sp.set(scores=[v["score"] for v in votes])
+            return votes
 
     async def query(self, query: str, *, router: Optional[Callable] = None,
                     max_tokens: int = 3000) -> str:
-        if not self.neurons:
-            return f"NOT_FOUND (brain {self.name}: empty)"
-        votes = await self.vote(query)
-        chosen = (router or self.router)(query, votes, self.neurons)
-        self.trace = [{"name": getattr(n, "name", str(i)), "score": votes[i]["score"],
-                       "opened": i in set(chosen)} for i, n in enumerate(self.neurons)]
-        picked = [self.neurons[i] for i in chosen]
-        if not picked:
-            return f"NOT_FOUND (brain {self.name}: router opened nothing)"
-        flat = [n for n in picked if isinstance(n, Neuron)]
-        deep = [n for n in picked if not isinstance(n, Neuron)]
-        flat_out, deep_out = await asyncio.gather(
-            _batch([n.instruct_msgs(query) for n in flat], max_tokens=max_tokens),
-            asyncio.gather(*(b.instruct(query) for b in deep)),
-        )
-        parts = [(n.name, _content(r)) for n, r in zip(flat, flat_out)]
-        parts += [(getattr(b, "name", "sub"), o) for b, o in zip(deep, deep_out)]
-        parts = [(n, t) for n, t in parts if "NOT_FOUND" not in t[:200]]
-        if not parts:
-            return f"NOT_FOUND (brain {self.name}: opened neurons had no answer)"
-        return await self.synthesizer(query, parts)
+      with trace.span("brain", self.name, n=len(self.neurons)) as _sp:
+          if not self.neurons:
+              return f"NOT_FOUND (brain {self.name}: empty)"
+          votes = await self.vote(query)
+          chosen = (router or self.router)(query, votes, self.neurons)
+          _sp.set(opened=len(list(chosen)))
+          self.trace = [{"name": getattr(n, "name", str(i)), "score": votes[i]["score"],
+                         "opened": i in set(chosen)} for i, n in enumerate(self.neurons)]
+          picked = [self.neurons[i] for i in chosen]
+          if not picked:
+              return f"NOT_FOUND (brain {self.name}: router opened nothing)"
+          flat = [n for n in picked if isinstance(n, Neuron)]
+          deep = [n for n in picked if not isinstance(n, Neuron)]
+          flat_out, deep_out = await asyncio.gather(
+              _batch([n.instruct_msgs(query) for n in flat], max_tokens=max_tokens),
+              asyncio.gather(*(b.instruct(query) for b in deep)),
+          )
+          parts = [(n.name, _content(r)) for n, r in zip(flat, flat_out)]
+          parts += [(getattr(b, "name", "sub"), o) for b, o in zip(deep, deep_out)]
+          parts = [(n, t) for n, t in parts if "NOT_FOUND" not in t[:200]]
+          if not parts:
+              return f"NOT_FOUND (brain {self.name}: opened neurons had no answer)"
+          return await self.synthesizer(query, parts)
 
     async def __call__(self, query: str, **kw) -> str:
         return await self.query(query, **kw)
@@ -191,14 +200,18 @@ async def fanout(chunks: Sequence[Content], query: str, *,
     when you want N sub-calls and will fold them yourself."""
     if not chunks:
         return []
-    resps = await _batch([_messages(c, query, prompt) for c in chunks], max_tokens=max_tokens)
-    return [_content(r) for r in resps]
+    with trace.span("fanout", f"{len(chunks)} chunks", n=len(chunks)):
+        resps = await _batch([_messages(c, query, prompt) for c in chunks],
+                             max_tokens=max_tokens)
+        return [_content(r) for r in resps]
 
 
 async def sub_llm(prompt: str, content: Content = "", *, max_tokens: int = 3000) -> str:
     """One sub-call. The simplest recursion step."""
-    out = await fanout([content], prompt, prompt=INSTRUCT_SYSTEM, max_tokens=max_tokens)
-    return out[0] if out else ""
+    with trace.span("sub_llm", prompt[:60]):
+        out = await fanout([content], prompt, prompt=INSTRUCT_SYSTEM,
+                           max_tokens=max_tokens)
+        return out[0] if out else ""
 
 
 # ── adapters ─────────────────────────────────────────────────────────────────
