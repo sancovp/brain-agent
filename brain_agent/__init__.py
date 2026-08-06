@@ -4,7 +4,8 @@
   Brain / build_digests                     recursive brains-whose-neurons-are-brains
   RLM                                       recursive language model over a growing corpus
   Neuron / Synthesizer / ComposedBrain      the SDK a shell agent composes at runtime
-  BrainShell / PyShell / Kernel             the persistent Python shell the agent drives
+  Orchestrator / PyShell / Kernel           an agent with one persistent runtime
+                                            context in which it builds brain systems
 
 Imports are LAZY (PEP 562). Everything that talks to a model needs heaven, but
 the shell and the kernel do not — and eagerly importing the package used to drag
@@ -15,7 +16,7 @@ module: PyShell and Kernel import with the standard library alone.
 import importlib
 from typing import TYPE_CHECKING
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 _EXPORTS = {
     # canonical heaven brain (the substrate everything extends) — needs heaven
@@ -32,7 +33,8 @@ _EXPORTS = {
     "from_dir": "sdk", "open_all_router": "sdk", "top_k_router": "sdk",
     "threshold_router": "sdk",
     # the shell + kernel — stdlib only
-    "PyShell": "shell", "BrainShell": "shell", "default_policy": "shell",
+    "PyShell": "shell", "default_policy": "shell",
+    "Orchestrator": "orchestrator", "shell_func": "orchestrator",
     "Kernel": "kernel", "serve": "kernel",
     # call-graph tracing — stdlib to record, networkx only to load
     "load_run": "trace", "text_tree": "trace", "load_records": "trace",
@@ -44,7 +46,7 @@ _ALIASES = {"ComposedBrain": ("sdk", "Brain")}
 # Submodules reachable as attributes. Without this, lazy __getattr__ shadows the
 # normal submodule lookup and `from brain_agent import trace` raises.
 _SUBMODULES = ("config", "brain_agent", "tools", "hierarchical", "rlm",
-               "sdk", "shell", "kernel", "trace")
+               "sdk", "shell", "kernel", "trace", "orchestrator")
 
 __all__ = sorted(list(_EXPORTS) + list(_ALIASES) + list(_SUBMODULES) + ["__version__"])
 
@@ -78,6 +80,7 @@ if TYPE_CHECKING:  # editors/type-checkers still see the real names
     from .sdk import (Neuron, Synthesizer, Brain as ComposedBrain, fanout,
                       sub_llm, from_dir, open_all_router, top_k_router,
                       threshold_router)
-    from .shell import PyShell, BrainShell, default_policy
+    from .shell import PyShell, default_policy
+    from .orchestrator import Orchestrator
     from .kernel import Kernel, serve
     from .trace import load_run, text_tree, load_records

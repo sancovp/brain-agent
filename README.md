@@ -113,70 +113,49 @@ Verified on a real 329-message agent transcript: 22 iterations / 3 phases
 auto-folded, incremental growth re-folds exactly the dirty branch, needle
 query answered with a verbatim source-cited quote.
 
-## The shell — RLM as the paper defines it (v0.5.0)
+## The orchestrator — RLM as the paper defines it (v0.8.0)
 
 The hierarchical brain above descends by a **fixed** Python program: the model
-only ever emits a relevance score, and `hierarchical.py` decides what to open.
-The RLM paper (arXiv:2512.24601 §2) requires the inverse — a symbolic handle to
-the corpus, **symbolic recursion** (the model invokes sub-calls from code *it*
-writes), and the answer returned from a variable rather than a finish action.
-That is what `shell.py` + `kernel.py` + `sdk.py` add.
+only emits a relevance score and `hierarchical.py` decides what to open. The RLM
+paper (arXiv:2512.24601 §2) requires the inverse — a symbolic handle to the
+data, **symbolic recursion** (the model invokes sub-calls from code *it* writes),
+and the answer returned from a variable rather than a finish action.
+
+A brain is N neurons + 1 synthesizer. In an RLM the synthesizer stops being a
+one-shot fold and becomes the thing that **runs the turn**: it builds brain
+systems and calls them however it wants, as many at once as it wants, until it
+is satisfied.
 
 ```python
-from brain_agent import BrainShell
+from brain_agent import Orchestrator
 
-sh = BrainShell(P=corpus, kernel="rlm")        # corpus is a VARIABLE, not a prompt
-answer = await sh.run("which ledger entries are disputed?")
+orch = Orchestrator(kernel="work")
+orch.bind(contracts=big_string)          # anything, by name, into the context
+answer = await orch.run("review these from three independent perspectives")
 ```
 
-The root model never sees the corpus. It writes Python against `P`, and only a
-bounded stdout preview comes back each turn — so root context scales with the
-number of turns, not with corpus size.
+- **One persistent runtime context.** Neurons, brains and whole systems it
+  builds are live Python objects in a kernel; results pipe between them as
+  values, never re-serialized through the model.
+- **The shell is a real tool** (`ShellTool`), called through heaven's native
+  tool loop. The model's output formatting is not load-bearing.
+- **No turn cap.** It decides when the answer is good enough. The only bound is
+  a runaway backstop (`BRAIN_MAX_TOOL_CALLS`, default 1000).
+- **Recursion needs no special case**, because a Brain is usable as a neuron.
 
-### The SDK, preloaded in the shell
+A real run, from the call graph: the orchestrator built three lensed brains, ran
+them concurrently inside one shell call, then built a *fourth* brain whose
+neurons were those three analyses:
 
-The agent composes these at runtime; nothing walks a directory unless it asks.
-
-| | |
-|---|---|
-| `Neuron(content, prompt=...)` | one chunk + one prompt |
-| `Synthesizer(prompt=...)` | folds `[(name, text), ...]` into one answer |
-| `Brain(neurons=[...], synthesizer=..., router=...)` | N neurons + 1 synthesizer; **a Brain is usable as a neuron**, so hierarchies nest |
-| `await brain.vote(q)` | raw relevance scores — route them yourself |
-| `await fanout(chunks, q)` | N parallel sub-calls |
-| `await sub_rlm(task, P=...)` | a nested shell agent on its own kernel (a sub-RLM) |
-| `from_dir(path)` | build a Brain from a directory tree |
-
-The router is a plain callable `(query, votes, neurons) -> [index]`. The old
-hardcoded traversal survives as `top_k_router()` — an explicit default, no
-longer the mechanism.
-
-### The kernel — state that outlives the caller
-
-A shell is only interactive if it is still there on the **next** turn. Every
-agent turn is a separate invocation, so the namespace lives in a daemon:
-
-```bash
-python -m brain_agent.kernel exec --name rlm 'CORPUS = open("big.txt").read()'
-python -m brain_agent.kernel exec --name rlm 'print(len(CORPUS))'   # new process
-python -m brain_agent.kernel ping --name rlm                        # live vars
 ```
-
-Variables, imports, functions, and any brains the agent built persist across
-processes. `Kernel` and `PyShell` import with the **standard library only** —
-no heaven, no langchain — so the shell works on a box with no model wired up.
-
-### Verified
-
-Shell/kernel (no model): namespace persistence across four separate OS
-processes; output captured even against a patched `builtins.print`
-(`heaven_base` rebinds it to something that reaches neither `sys.stdout` nor
-fd 1); a 200,000-char `Final` pulled out of the kernel.
-
-Live (MiniMax-M2.7-highspeed via heaven): all ten SDK primitives; `sub_rlm`
-recursion onto a child kernel; and an end-to-end run over a 60,709-char corpus
-in which the model wrote seven cells, abandoned a first decomposition that
-produced 1,188 false positives, recovered, and returned the correct answer.
+orchestrator Review these contracts from three independent expert  166.89s
+  shell    import asyncio                                           43.91s
+    brain    Legal Risk Brain            opened=3/3  scores=[10, 9, 9]
+    brain    Financial Exposure Brain    opened=3/3  scores=[10, 9, 9]
+    brain    Renewal Timeline Brain      opened=3/3  scores=[8, 9, 6]
+  shell    from brain_agent import Neuron, Synthesizer, Compose     61.68s
+    brain    Priority Synthesizer        opened=3/3  scores=[10, 9, 10]
+```
 
 ## Call-graph tracing (v0.6.0)
 
