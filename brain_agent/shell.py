@@ -53,7 +53,7 @@ def _shell_print(*args, sep=" ", end="\n", file=None, flush=False):
 
 def default_policy(src: str) -> Optional[str]:
     """Return a refusal string to block, or None to allow. Replace wholesale by
-    passing `policy=` to BrainShell — this is a knob, not a sandbox."""
+    passing `policy=` to the shell — this is a knob, not a sandbox."""
     for bad in DEFAULT_DENY:
         if bad in src:
             return f"blocked by policy: {bad!r}"
