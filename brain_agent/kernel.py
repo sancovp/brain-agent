@@ -64,6 +64,13 @@ async def serve(name: str, policy=default_policy, idle_timeout: Optional[float] 
             if req.get("op") == "ping":
                 resp = {"ok": True, "pid": os.getpid(),
                         "vars": sorted(k for k in shell.ns if not k.startswith("__"))}
+            elif req.get("op") == "getvar":
+                key = req.get("name", "")
+                present = key in shell.ns and shell.ns[key] is not None
+                val = shell.ns.get(key)
+                resp = {"ok": True, "set": present,
+                        "value": val if isinstance(val, str) else
+                                 (None if val is None else str(val))}
             elif req.get("op") == "shutdown":
                 resp = {"ok": True}
                 writer.write((json.dumps(resp) + "\n").encode()); await writer.drain()
@@ -151,6 +158,13 @@ class Kernel:
     def vars(self) -> list:
         return self._request({"op": "ping"}).get("vars", [])
 
+    def getvar(self, name: str, timeout: float = 60) -> Optional[str]:
+        """Pull a variable's value out of the remote namespace. Returns None if
+        unset — this is how the loop retrieves `Final` without it ever passing
+        through the root's context window."""
+        r = self._request({"op": "getvar", "name": name}, timeout=timeout)
+        return r.get("value") if r.get("ok") and r.get("set") else None
+
     def shutdown(self) -> None:
         try:
             self._request({"op": "shutdown"}, timeout=5)
@@ -165,7 +179,7 @@ class Kernel:
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv:
-        print(__doc__)
+        sys.stdout.write((__doc__ or "") + "\n")
         return 0
     op, argv = argv[0], argv[1:]
     name = "default"
@@ -185,12 +199,13 @@ def main(argv=None):
         k.start()                      # idempotent: attach if up, spawn if not
         sys.stdout.write(k.exec(code))
     elif op == "ping":
-        print(json.dumps({"alive": k.alive(), "vars": k.vars() if k.alive() else []}))
+        # not print(): heaven_base patches builtins.print and it never reaches fd 1
+        sys.stdout.write(json.dumps({"alive": k.alive(), "vars": k.vars() if k.alive() else []}) + "\n")
     elif op == "shutdown":
         k.shutdown()
-        print("stopped")
+        sys.stdout.write("stopped\n")
     else:
-        print(f"unknown op {op!r}")
+        sys.stdout.write(f"unknown op {op!r}\n")
         return 2
     return 0
 

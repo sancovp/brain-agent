@@ -40,6 +40,22 @@ DEFAULT_DENY = ("shutil.rmtree", "os.system", "subprocess", "os.remove",
                 "os.unlink", "sys.exit", "__import__('os').system")
 
 
+def _shell_print(*args, sep=" ", end="\n", file=None, flush=False):
+    """The shell's own `print`.
+
+    heaven_base monkeypatches `builtins.print` (verified: `builtins.print.
+    __module__ == 'heaven_base'`), and its replacement writes to neither
+    sys.stdout nor fd 1 — so agent `print()` output vanished entirely and no
+    amount of redirect_stdout or dup2 could catch it. Binding print in the
+    exec namespace makes the agent's output ours again, whatever the ambient
+    builtins have been patched to.
+    """
+    stream = file if file is not None else sys.stdout
+    stream.write(sep.join(str(a) for a in args) + end)
+    if flush:
+        stream.flush()
+
+
 def default_policy(src: str) -> Optional[str]:
     """Return a refusal string to block, or None to allow. Replace wholesale by
     passing `policy=` to BrainShell — this is a knob, not a sandbox."""
@@ -82,6 +98,7 @@ class PyShell:
                 # Also point sys.stdout at fd 1 so Python-level writes land there
                 # even if something replaced the original object.
                 sys.stdout = os.fdopen(os.dup(1), "w", encoding="utf-8", errors="replace")
+                self.ns["print"] = _shell_print     # beat any patched builtins.print
                 try:
                     code = compile(src, "<brain-shell>", "exec",
                                    flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
@@ -156,41 +173,79 @@ def _describe(value: Any) -> str:
     return f"P is a {type(value).__name__}: {str(value)[:400]}"
 
 
+BOOTSTRAP = """
+from pathlib import Path as Path
+from brain_agent import sdk as sdk
+from brain_agent.sdk import (Neuron, Synthesizer, Brain, fanout, sub_llm,
+                             from_dir, open_all_router, top_k_router,
+                             threshold_router)
+Final = None
+__depth__ = {depth}
+__max_depth__ = {max_depth}
+__kernel__ = {kernel!r}
+
+async def sub_rlm(task, P="", **kw):
+    '''Open a NESTED kernel-backed shell. The child is an RLM too.'''
+    if __depth__ >= __max_depth__:
+        return await sub_llm(task, P)
+    from brain_agent.shell import BrainShell
+    child = BrainShell(P=P, depth=__depth__ + 1, max_depth=__max_depth__,
+                       kernel=f"{{__kernel__}}-sub{{__depth__ + 1}}", **kw)
+    return await child.run(task)
+"""
+
+LOAD_P_TEXT = "P = Path({path!r}).read_text(errors='replace')\n"
+LOAD_P_PATH = "P = Path({path!r})\n"
+
+
 @dataclass
 class BrainShell:
-    """One shell + one root agent driving it."""
+    """One PERSISTENT kernel + one root agent driving it.
+
+    The namespace lives in a `brain_agent.kernel` daemon, not in this process,
+    so everything the agent builds — variables, chunkings, neurons, whole brains
+    — survives this loop, this process, and this turn. Re-instantiating
+    BrainShell with the same `kernel` name reattaches to the same state.
+    """
     P: Any = ""
     policy: Optional[Callable] = default_policy
     max_iters: int = MAX_ITERS
     depth: int = 0
     max_depth: int = 2
+    kernel: str = "rlm"
+    reset: bool = False
     transcript: list = field(default_factory=list)
 
     def __post_init__(self):
-        # Lazy so PyShell stays importable heaven-free (the v0.3.1 packaging goal).
-        from . import sdk
-        from .sdk import (Brain, Neuron, Synthesizer, fanout, sub_llm, from_dir,
-                          open_all_router, top_k_router, threshold_router)
-        self.shell = PyShell(policy=self.policy)
-        self.shell.ns.update({
-            "P": self.P, "Final": None,
-            "Neuron": Neuron, "Synthesizer": Synthesizer, "Brain": Brain,
-            "fanout": fanout, "sub_llm": sub_llm, "from_dir": from_dir,
-            "open_all_router": open_all_router, "top_k_router": top_k_router,
-            "threshold_router": threshold_router, "sdk": sdk, "Path": Path,
-            "sub_rlm": self._make_sub_rlm(),
-        })
+        from .kernel import Kernel
+        self.k = Kernel(self.kernel)
+        if self.reset and self.k.alive():
+            self.k.shutdown()
+        self.k.start()
+        # Bootstrap only once per kernel — reattaching must not clobber state.
+        if "sub_rlm" not in self.k.vars():
+            self.k.exec(BOOTSTRAP.format(depth=self.depth, max_depth=self.max_depth,
+                                         kernel=self.kernel))
+        self._load_P()
 
-    def _make_sub_rlm(self) -> Callable:
-        async def sub_rlm(task: str, P: Any = "", **kw) -> str:
-            """Open a nested shell with the same SDK. The child is an RLM too."""
-            if self.depth >= self.max_depth:
-                from .sdk import sub_llm
-                return await sub_llm(task, P)
-            child = BrainShell(P=P, policy=self.policy, depth=self.depth + 1,
-                               max_depth=self.max_depth, **kw)
-            return await child.run(task)
-        return sub_rlm
+    def _load_P(self) -> None:
+        """Move the corpus into the kernel WITHOUT routing it through this
+        process's memory twice or through the root's context at all."""
+        if isinstance(self.P, Path):
+            self.k.exec(LOAD_P_PATH.format(path=str(self.P)))
+        elif isinstance(self.P, str) and self.P:
+            tmp = Path(tempfile.gettempdir()) / f"brain-P-{self.kernel}.txt"
+            tmp.write_text(self.P, errors="replace")
+            self.k.exec(LOAD_P_TEXT.format(path=str(tmp)))
+        elif "P" not in self.k.vars():
+            self.k.exec("P = ''\n")
+
+    # convenience: talk to the kernel directly (same shell the agent uses)
+    def exec(self, code: str) -> str:
+        return self.k.exec(code)
+
+    def vars(self) -> list:
+        return self.k.vars()
 
     async def run(self, task: str) -> str:
         from langchain_core.messages import SystemMessage, HumanMessage
@@ -206,14 +261,14 @@ class BrainShell:
                 hist.append(HumanMessage(content=
                     "No ```python cell found. Emit one, or set Final."))
                 continue
-            out = await self.shell.run(code)
+            out = self.k.exec(code)
             self.transcript.append({"code": code, "stdout": out})
-            final = self.shell.ns.get("Final")
+            final = self.k.getvar("Final")
             if final is not None:
-                return final if isinstance(final, str) else str(final)
+                return final
             meta = (f"[stdout {len(out)} chars]\n{out[:STDOUT_PREVIEW]}"
                     + ("\n…truncated" if len(out) > STDOUT_PREVIEW else ""))
             hist.append(HumanMessage(content=meta or "[no output]"))
-        final = self.shell.ns.get("Final")
-        return str(final) if final is not None else \
+        final = self.k.getvar("Final")
+        return final if final is not None else \
             f"NOT_FOUND (root hit {self.max_iters} iterations without setting Final)"

@@ -1,150 +1,105 @@
-"""RLM shell tests.
+"""Shell + kernel tests.
 
-The provider round-trip is stubbed (`_batch`), so these prove the MECHANISM:
-the root writes code, the code runs in a persistent namespace, sub-calls are
-launched from that code, and the answer comes back out of `Final` — never
-through the root's context window.
+These test the SHELL, which is the part that must be true regardless of any
+model: a persistent namespace that OUTLIVES the caller.
 
-Run: PYTHONNOUSERSITE=1 python tests/test_shell.py
+Note what is deliberately NOT here: the old stubbed BrainShell root-loop tests.
+They monkeypatched `_batch` in the test process, which is meaningless now that
+the namespace lives in a separate kernel process — the stub could never reach
+it. A root-loop test needs a live model; anything else is theatre.
+
+Run: python tests/test_shell.py
 """
-import asyncio
+import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
 
-from brain_agent import hierarchical, shell as shell_mod, sdk
-from brain_agent.shell import BrainShell, PyShell
+os.environ.setdefault("BRAIN_KERNEL_DIR", tempfile.mkdtemp(prefix="brain-kernels-"))
 
+import asyncio  # noqa: E402
+from brain_agent.shell import PyShell  # noqa: E402
+from brain_agent.kernel import Kernel  # noqa: E402
 
-class FakeResp:
-    def __init__(self, text):
-        self.content = text
-
-
-def script_model(turns):
-    """Replace heaven's _batch with a scripted model. Each root call pops the
-    next scripted reply; neuron/fanout batches answer per-message."""
-    state = {"i": 0, "neuron_calls": 0, "seen_by_root": []}
-
-    async def fake_batch(message_lists, **kw):
-        # A neuron/fanout batch: many messages at once, or a non-root system prompt.
-        first = message_lists[0][0].content if message_lists and message_lists[0] else ""
-        if not first.startswith("You are the root"):
-            state["neuron_calls"] += len(message_lists)
-            out = []
-            for ml in message_lists:
-                body = ml[0].content
-                out.append(FakeResp("FOUND: acct 44-9 mismatch" if "44-9" in body else "NOT_FOUND"))
-            return out
-        # A root call: record what the root was allowed to see, return next script line.
-        state["seen_by_root"].append("\n".join(m.content for m in message_lists[0]))
-        i = state["i"]
-        state["i"] += 1
-        return [FakeResp(turns[i] if i < len(turns) else "```python\nFinal = 'gave up'\n```")]
-
-    return fake_batch, state
+KERNEL = "test-rlm"
 
 
-CORPUS = "\n\n".join(
-    [f"ledger entry {i}: acct {i}-0 ok" for i in range(40)]
-    + ["ledger entry 99: acct 44-9 MISMATCH against invoice 7"]
-    + [f"ledger entry {i}: acct {i}-1 ok" for i in range(40, 80)]
-)
-
-
-def test_root_loop_writes_code_and_returns_via_final():
-    turns = [
-        # 1. the root inspects P without ever printing it
-        "```python\nchunks = P.split('\\n\\n')\nprint('chunks:', len(chunks))\n```",
-        # 2. it launches N sub-calls from code IT wrote
-        "```python\nouts = await fanout(chunks, 'find any mismatch')\n"
-        "hits = [o for o in outs if o.startswith('FOUND')]\nprint('hits:', len(hits))\n```",
-        # 3. the answer leaves via a variable, not the context window
-        "```python\nFinal = 'MISMATCH: ' + hits[0] + ' (' + 'x' * 5000 + ')'\n```",
-    ]
-    fake, state = script_model(turns)
-    hierarchical._batch = fake
-    sdk._batch = fake
-
-    sh = BrainShell(P=CORPUS)
-    answer = asyncio.run(sh.run("which ledger entries disagree with an invoice?"))
-
-    assert answer.startswith("MISMATCH: FOUND: acct 44-9"), answer
-    # unbounded output: Final is returned verbatim, past any root output window
-    assert len(answer) > 5000, len(answer)
-    # symbolic recursion: 81 sub-calls launched from model-authored code
-    assert state["neuron_calls"] == 81, state["neuron_calls"]
-    # symbolic handle: the corpus never entered the root's context
-    root_saw = "\n".join(state["seen_by_root"])
-    assert "44-9 MISMATCH against invoice 7" not in root_saw
-    assert "ledger entry 20" not in root_saw
-    assert f"P is a str of {len(CORPUS)} chars" in root_saw
-    print(f"ok  root_loop        sub_calls={state['neuron_calls']} answer={len(answer)}ch "
-          f"root_context={len(root_saw)}ch corpus={len(CORPUS)}ch")
-
-
-def test_stdout_is_truncated_to_metadata():
-    turns = ["```python\nprint('z' * 50000)\n```", "```python\nFinal = 'done'\n```"]
-    fake, state = script_model(turns)
-    hierarchical._batch = fake
-    sdk._batch = fake
-    sh = BrainShell(P="tiny")
-    asyncio.run(sh.run("t"))
-    assert len(state["seen_by_root"][-1]) < 20000, len(state["seen_by_root"][-1])
-    assert "truncated" in state["seen_by_root"][-1]
-    print("ok  stdout_truncated  root never ate the 50k print")
-
-
-def test_namespace_persists_and_policy_blocks():
+def test_pyshell_mechanics():
     sh = PyShell()
-    asyncio.run(sh.run("acc = []"))
+    assert asyncio.run(sh.run("acc = []")) == ""
     asyncio.run(sh.run("acc.append(1)"))
-    out = asyncio.run(sh.run("print(len(acc))"))
-    assert out.strip() == "1", out
-    blocked = asyncio.run(sh.run("import shutil; shutil.rmtree('/tmp/x')"))
-    assert blocked.startswith("blocked by policy"), blocked
-    err = asyncio.run(sh.run("1/0"))
-    assert "ZeroDivisionError" in err
-    print("ok  namespace+policy  state persists, denylist holds, tracebacks captured")
+    assert asyncio.run(sh.run("print(len(acc))")).strip() == "1"
+    assert "await ok" in asyncio.run(sh.run(
+        "import asyncio\nawait asyncio.sleep(0)\nprint('await ok')"))
+    assert asyncio.run(sh.run("import shutil; shutil.rmtree('/x')")).startswith("blocked by policy")
+    assert "ZeroDivisionError" in asyncio.run(sh.run("1/0"))
+    print("ok  pyshell           persist, top-level await, policy, traceback")
 
 
-def test_sub_rlm_nests_and_caps_depth():
-    fake, state = script_model(["```python\nFinal = 'child answer'\n```"])
-    hierarchical._batch = fake
-    sdk._batch = fake
-    parent = BrainShell(P="", max_depth=2)
-    child_out = asyncio.run(parent.shell.ns["sub_rlm"]("do a subtask", P="sub corpus"))
-    assert child_out == "child answer", child_out
+def test_print_survives_patched_builtins():
+    """heaven_base rebinds builtins.print to something that reaches neither
+    sys.stdout nor fd 1. The shell binds its own print so agent output is
+    always captured."""
+    import builtins
+    original = builtins.print
+    builtins.print = lambda *a, **k: None          # simulate the patch
+    try:
+        sh = PyShell()
+        out = asyncio.run(sh.run("print('still captured')"))
+        assert out.strip() == "still captured", repr(out)
+    finally:
+        builtins.print = original
+    print("ok  patched_print     agent output captured despite a hostile builtins.print")
 
-    deep = BrainShell(P="", depth=2, max_depth=2)
-    leaf = asyncio.run(deep.shell.ns["sub_rlm"]("too deep", P="x"))
-    assert leaf in ("NOT_FOUND", "") or "NOT_FOUND" in leaf, leaf
-    print("ok  sub_rlm           nested shell answers; depth cap degrades to sub_llm")
+
+def _cli(*args):
+    """Drive the kernel from a genuinely separate PROCESS — the whole point."""
+    r = subprocess.run([sys.executable, "-m", "brain_agent.kernel", *args],
+                       capture_output=True, text=True, cwd=str(REPO),
+                       env={**os.environ, "PYTHONPATH": str(REPO) + os.pathsep
+                            + os.environ.get("PYTHONPATH", "")})
+    return r.stdout
 
 
-def test_agent_can_compose_a_brain_at_runtime():
-    """The SDK is composable: neurons, a synthesizer and a custom router built
-    from values in the shell, with no directory anywhere."""
-    fake, _ = script_model([])
-    hierarchical._batch = fake
-    sdk._batch = fake
-    sh = PyShell()
-    sh.ns.update({"Neuron": sdk.Neuron, "Brain": sdk.Brain,
-                  "Synthesizer": sdk.Synthesizer, "asyncio": asyncio})
-    out = asyncio.run(sh.run(
-        "ns = [Neuron(content=c, name=f'n{i}') for i, c in enumerate(['a', 'acct 44-9', 'c'])]\n"
-        "def my_router(q, votes, neurons): return [i for i, n in enumerate(neurons) if '44-9' in str(n.content)]\n"
-        "b = Brain(neurons=ns, router=my_router, name='adhoc')\n"
-        "print('built', b.name, len(b.neurons), 'router picks', my_router(None, None, ns))\n"))
-    assert "built adhoc 3 router picks [1]" in out, out
-    print("ok  compose_at_runtime neurons+brain+custom router built in the shell")
+def test_kernel_state_outlives_the_caller():
+    """Each _cli call is a separate OS process. State must survive all of them."""
+    Kernel(KERNEL).shutdown()
+    _cli("exec", "--name", KERNEL, "import json; CORPUS = 'acct 44-9 MISMATCH ' * 500")
+    out = _cli("exec", "--name", KERNEL, "print('read back:', len(CORPUS))")
+    assert "read back: 9500" in out, out
+    _cli("exec", "--name", KERNEL,
+         "def chunk(s, n=200): return [s[i:i+n] for i in range(0, len(s), n)]\n"
+         "class Neuron:\n    def __init__(s, c): s.c = c")
+    out = _cli("exec", "--name", KERNEL,
+               "ns = [Neuron(c) for c in chunk(CORPUS)]\n"
+               "hits = [i for i, n in enumerate(ns) if '44-9' in n.c]\n"
+               "print(json.dumps({'neurons': len(ns), 'hits': len(hits)}))")
+    assert '"neurons": 48' in out and '"hits": 48' in out, out
+    live = Kernel(KERNEL).vars()
+    for name in ("CORPUS", "Neuron", "chunk", "ns", "hits", "json"):
+        assert name in live, (name, live)
+    print(f"ok  kernel_persists    4 separate processes, one namespace: {sorted(live)}")
+
+
+def test_getvar_pulls_large_final():
+    """Final leaves via the namespace, so it is not bounded by any context or
+    stdout window."""
+    k = Kernel(KERNEL)
+    assert k.getvar("Final") is None
+    _cli("exec", "--name", KERNEL, "Final = 'X' * 200000")
+    val = k.getvar("Final")
+    assert val is not None and len(val) == 200000, len(val or "")
+    print(f"ok  final_via_var     pulled {len(val):,} chars out of the kernel")
+    k.shutdown()
 
 
 if __name__ == "__main__":
-    test_namespace_persists_and_policy_blocks()
-    test_agent_can_compose_a_brain_at_runtime()
-    test_root_loop_writes_code_and_returns_via_final()
-    test_stdout_is_truncated_to_metadata()
-    test_sub_rlm_nests_and_caps_depth()
-    print("\nall shell tests passed (provider stubbed — no real model call)")
+    test_pyshell_mechanics()
+    test_print_survives_patched_builtins()
+    test_kernel_state_outlives_the_caller()
+    test_getvar_pulls_large_final()
+    print("\nall shell/kernel tests passed (no model involved — by design)")
