@@ -15,7 +15,7 @@ module: PyShell and Kernel import with the standard library alone.
 import importlib
 from typing import TYPE_CHECKING
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 _EXPORTS = {
     # canonical heaven brain (the substrate everything extends) — needs heaven
@@ -34,15 +34,26 @@ _EXPORTS = {
     # the shell + kernel — stdlib only
     "PyShell": "shell", "BrainShell": "shell", "default_policy": "shell",
     "Kernel": "kernel", "serve": "kernel",
+    # call-graph tracing — stdlib to record, networkx only to load
+    "load_run": "trace", "text_tree": "trace", "load_records": "trace",
 }
 
 # `Brain` is the directory-walking brain; the composable one is ComposedBrain.
 _ALIASES = {"ComposedBrain": ("sdk", "Brain")}
 
-__all__ = sorted(list(_EXPORTS) + list(_ALIASES) + ["__version__"])
+# Submodules reachable as attributes. Without this, lazy __getattr__ shadows the
+# normal submodule lookup and `from brain_agent import trace` raises.
+_SUBMODULES = ("config", "brain_agent", "tools", "hierarchical", "rlm",
+               "sdk", "shell", "kernel", "trace")
+
+__all__ = sorted(list(_EXPORTS) + list(_ALIASES) + list(_SUBMODULES) + ["__version__"])
 
 
 def __getattr__(name):
+    if name in _SUBMODULES:
+        mod = importlib.import_module(f".{name}", __name__)
+        globals()[name] = mod
+        return mod
     if name in _ALIASES:
         mod, attr = _ALIASES[name]
     elif name in _EXPORTS:
@@ -69,3 +80,4 @@ if TYPE_CHECKING:  # editors/type-checkers still see the real names
                       threshold_router)
     from .shell import PyShell, BrainShell, default_policy
     from .kernel import Kernel, serve
+    from .trace import load_run, text_tree, load_records

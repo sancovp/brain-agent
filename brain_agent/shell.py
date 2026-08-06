@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from . import trace          # stdlib-only; recording is a no-op unless enabled
+
 STDOUT_PREVIEW = 2000          # chars of stdout the root is allowed to see
 MAX_ITERS = 24
 
@@ -174,8 +176,11 @@ def _describe(value: Any) -> str:
 
 
 BOOTSTRAP = """
+import asyncio as asyncio
+from asyncio import gather as gather   # so the agent can fan out sub_rlm calls
 from pathlib import Path as Path
-from brain_agent import sdk as sdk
+import brain_agent.sdk as sdk
+import brain_agent.trace as trace
 from brain_agent.sdk import (Neuron, Synthesizer, Brain, fanout, sub_llm,
                              from_dir, open_all_router, top_k_router,
                              threshold_router)
@@ -183,15 +188,25 @@ Final = None
 __depth__ = {depth}
 __max_depth__ = {max_depth}
 __kernel__ = {kernel!r}
+__sub_seq__ = [0]
 
 async def sub_rlm(task, P="", **kw):
-    '''Open a NESTED kernel-backed shell. The child is an RLM too.'''
+    '''Open a NESTED kernel-backed shell. The child is an RLM too.
+
+    Each call gets its OWN kernel. Naming children by depth alone made two
+    concurrent sub_rlm calls collide on one kernel and clobber each other's
+    namespace — which broke exactly the case worth having, several children
+    running at once under asyncio.gather.
+    '''
     if __depth__ >= __max_depth__:
         return await sub_llm(task, P)
     from brain_agent.shell import BrainShell
-    child = BrainShell(P=P, depth=__depth__ + 1, max_depth=__max_depth__,
-                       kernel=f"{{__kernel__}}-sub{{__depth__ + 1}}", **kw)
-    return await child.run(task)
+    __sub_seq__[0] += 1          # incremented before any await: no interleaving
+    name = f"{{__kernel__}}-d{{__depth__ + 1}}n{{__sub_seq__[0]}}"
+    with trace.span('sub_rlm', task[:80], child_kernel=name):
+        child = BrainShell(P=P, depth=__depth__ + 1, max_depth=__max_depth__,
+                           kernel=name, **kw)
+        return await child.run(task)
 """
 
 LOAD_P_TEXT = "P = Path({path!r}).read_text(errors='replace')\n"
@@ -252,8 +267,11 @@ class BrainShell:
         from .hierarchical import _batch, _content
         hist = [SystemMessage(content=ROOT_SYSTEM),
                 HumanMessage(content=f"{_describe(self.P)}\n\nTask: {task}")]
+        root = trace.span("root", task[:120], kernel=self.kernel, depth=self.depth)
+        root.__enter__()
         for i in range(self.max_iters):
-            resp = await _batch([hist], max_tokens=2000)
+            with trace.span("turn", f"turn {i}"):
+                resp = await _batch([hist], max_tokens=2000)
             reply = _content(resp[0]) if resp else ""
             # AIMessage, not SystemMessage: providers reject non-consecutive
             # system messages, and the reply IS the assistant's turn.
@@ -263,14 +281,17 @@ class BrainShell:
                 hist.append(HumanMessage(content=
                     "No ```python cell found. Emit one, or set Final."))
                 continue
-            out = self.k.exec(code)
+            with trace.span("cell", code.strip().splitlines()[0][:80] if code.strip() else ""):
+                out = self.k.exec(code)
             self.transcript.append({"code": code, "stdout": out})
             final = self.k.getvar("Final")
             if final is not None:
+                root.__exit__(None, None, None)
                 return final
             meta = (f"[stdout {len(out)} chars]\n{out[:STDOUT_PREVIEW]}"
                     + ("\n…truncated" if len(out) > STDOUT_PREVIEW else ""))
             hist.append(HumanMessage(content=meta or "[no output]"))
         final = self.k.getvar("Final")
+        root.__exit__(None, None, None)
         return final if final is not None else \
             f"NOT_FOUND (root hit {self.max_iters} iterations without setting Final)"
