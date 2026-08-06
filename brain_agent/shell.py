@@ -248,14 +248,16 @@ class BrainShell:
         return self.k.vars()
 
     async def run(self, task: str) -> str:
-        from langchain_core.messages import SystemMessage, HumanMessage
+        from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
         from .hierarchical import _batch, _content
         hist = [SystemMessage(content=ROOT_SYSTEM),
                 HumanMessage(content=f"{_describe(self.P)}\n\nTask: {task}")]
         for i in range(self.max_iters):
             resp = await _batch([hist], max_tokens=2000)
             reply = _content(resp[0]) if resp else ""
-            hist.append(SystemMessage(content=f"[assistant turn {i}]\n{reply}"))
+            # AIMessage, not SystemMessage: providers reject non-consecutive
+            # system messages, and the reply IS the assistant's turn.
+            hist.append(AIMessage(content=reply))
             code = _extract_code(reply)
             if code is None:
                 hist.append(HumanMessage(content=
