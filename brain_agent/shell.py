@@ -21,9 +21,10 @@ LLM writes the program, at runtime, per query.
 from __future__ import annotations
 
 import ast
-import contextlib
 import inspect
-import io
+import os
+import sys
+import tempfile
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -58,22 +59,50 @@ class PyShell:
     policy: Optional[Callable] = default_policy
 
     async def run(self, src: str) -> str:
-        """Execute a cell; return captured stdout (plus traceback on error)."""
+        """Execute a cell; return captured stdout (plus traceback on error).
+
+        Capture is at the FILE DESCRIPTOR level, not via `contextlib.
+        redirect_stdout`. An agent shell runs arbitrary code: libraries rebind
+        `builtins.print`, replace `sys.stdout`, or write to fd 1 from C — all of
+        which silently defeat redirect_stdout. (Observed: importing the heaven
+        chain breaks redirect_stdout outright.) dup2 catches every case.
+        """
         if self.policy:
             refusal = self.policy(src)
             if refusal:
                 return refusal
-        buf = io.StringIO()
-        try:
-            code = compile(src, "<brain-shell>", "exec",
-                           flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
-            with contextlib.redirect_stdout(buf):
-                result = eval(code, self.ns)          # noqa: S307 — that is the point
-                if inspect.iscoroutine(result):
-                    await result
-        except Exception:
-            buf.write(traceback.format_exc(limit=4))
-        return buf.getvalue()
+
+        err: Optional[str] = None
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as tmp:
+            saved_fd = os.dup(1)
+            saved_stdout = sys.stdout
+            try:
+                sys.stdout.flush()
+                os.dup2(tmp.fileno(), 1)
+                # Also point sys.stdout at fd 1 so Python-level writes land there
+                # even if something replaced the original object.
+                sys.stdout = os.fdopen(os.dup(1), "w", encoding="utf-8", errors="replace")
+                try:
+                    code = compile(src, "<brain-shell>", "exec",
+                                   flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                    result = eval(code, self.ns)      # noqa: S307 — that is the point
+                    if inspect.iscoroutine(result):
+                        await result
+                except BaseException:                  # noqa: BLE001 — report, never raise
+                    err = traceback.format_exc(limit=4)
+                finally:
+                    try:
+                        sys.stdout.flush()
+                        sys.stdout.close()
+                    except Exception:
+                        pass
+            finally:
+                os.dup2(saved_fd, 1)
+                os.close(saved_fd)
+                sys.stdout = saved_stdout
+            tmp.seek(0)
+            out = tmp.read()
+        return out + (err or "")
 
 
 # ── the root loop (Algorithm 1) ──────────────────────────────────────────────
