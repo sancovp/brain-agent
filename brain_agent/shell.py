@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import re
 import os
 import sys
 import tempfile
@@ -133,9 +134,27 @@ sub-calls read the data.
 The corpus is already in the shell as the variable `P`. You have never seen it
 and you never will; inspect it with code.
 
+Everything below is ALREADY IN SCOPE. Do NOT import it and do NOT run
+`from brain_agent import ...` — the package also exports a DIFFERENT, directory-
+based class called Brain, and importing it will shadow the one you want. Do not
+spend turns introspecting the API; it is documented here in full.
+
 Preloaded (brain-agent SDK):
-  Neuron(content, name=..., prompt=...)      one chunk + one prompt; await it
-  Synthesizer(prompt=...)                    folds [(name, text), ...] -> answer
+  Neuron(content, name=..., prompt=...)      one chunk + one LENS; await it.
+    `prompt=` IS the lens — it decides what this neuron reports and what it
+    ignores. Give the SAME content different lenses to get independent readings
+    that cannot contaminate each other, e.g.
+      lenses = {"legal": "Report ONLY legal risk. Ignore money and dates.",
+                "money": "Report ONLY amounts and payment terms."}
+      ns = [Neuron(content=doc, name=k, prompt=v) for k, v in lenses.items()]
+      reads = await gather(*(n("review this") for n in ns))
+    `cognize_prompt=` is the routing lens (how it scores its own relevance).
+  Synthesizer(prompt=...)                    folds [(name, text), ...] -> answer.
+    `prompt=` controls the FORM of the result — ask for JSON, a table, a ranking.
+    Pass it to a Brain as Brain(..., synthesizer=Synthesizer(prompt=...)),
+    or call it directly: await synth(parts) — or await synth(query, parts).
+    `parts` may be a dict {name: text}, a list of (name, text), or a list of
+    plain strings.
   Brain(neurons=[...], synthesizer=..., router=...)   N neurons + 1 synthesizer;
                                              a Brain is usable AS a neuron, so
                                              nest them for hierarchies
@@ -148,6 +167,11 @@ Preloaded (brain-agent SDK):
 Plus the whole standard library.
 
 Rules:
+  * The shell PERSISTS between turns — variables, imports, and every result you
+    computed are still there next turn. Assign expensive results to variables
+    and REUSE them. Never re-run a sub-call, neuron, or fanout you have already
+    run: if a later cell fails, fix only the failing line and use the results
+    already sitting in the namespace.
   * Emit ONE ```python cell per turn. Only stdout comes back, truncated — do not
     print the corpus, print what you concluded.
   * Build the decomposition yourself: slice P, construct neurons, choose N,
@@ -157,13 +181,27 @@ Rules:
 """
 
 
+_FENCE = re.compile(r"```([A-Za-z0-9_+.-]*)[ \t]*\r?\n(.*?)```", re.S)
+_PY_TAGS = ("python", "py", "python3", "ipython", "")
+
+
 def _extract_code(text: str) -> Optional[str]:
-    if "```" not in text:
+    """Pull the cell out of the reply.
+
+    The old version took `text.split("```", 2)[1]` — the FIRST fence, with no
+    closing-fence requirement and only the literal tag "python" stripped. That
+    executes an illustrative ```text block instead of the real cell, executes
+    trailing prose when a fence is left unterminated, and dies on ```py. The
+    failure mode is "ran the wrong text", not a clean error, so it is worth
+    being strict: require a closing fence, accept any python-ish tag, and when
+    there are several, take the LAST one (models explain first, then commit).
+    """
+    blocks = _FENCE.findall(text)
+    if not blocks:
         return None
-    block = text.split("```", 2)[1]
-    if block.startswith("python"):
-        block = block[len("python"):]
-    return block.strip("\n") or None
+    py = [body for tag, body in blocks if tag.lower() in _PY_TAGS]
+    chosen = py[-1] if py else blocks[-1][1]
+    return chosen.strip("\n") or None
 
 
 def _describe(value: Any) -> str:

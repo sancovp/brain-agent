@@ -42,9 +42,20 @@ DEFAULT_SYNTH_PROMPT = (
     "present in the blocks. If the blocks do not answer the query, say NOT_FOUND.")
 
 
+# Appended to EVERY neuron system prompt, built-in or custom. Without it a terse
+# custom lens ("Report only amounts.") lets the model answer the query from
+# general knowledge and ignore its chunk entirely — observed live, and it fails
+# silently, which is the worst way for a lens to fail. Grounding is an invariant
+# of what a neuron IS, not something each lens should have to restate.
+NEURON_FRAME = ("\n\nThe <neuron content> block below is your ENTIRE knowledge for "
+                "this task. Answer only from it, never from general knowledge or "
+                "from the wording of the query.")
+
+
 def _messages(content: Content, query: str, system: str) -> list:
     """Render one neuron call. A Path goes through heaven's path= block (so file
     handling stays identical to tools.py); a str is inlined directly."""
+    system = system + NEURON_FRAME
     if isinstance(content, Path):
         return _neuron_messages(str(content), query, system)
     return [SystemMessage(content=f"{system}\n\n<neuron content>\n{content}\n</neuron content>"),
@@ -87,11 +98,41 @@ class Synthesizer:
     name: str = "synthesizer"
     max_tokens: int = 4000
 
-    async def __call__(self, query: str, parts: Sequence[tuple]) -> str:
+    @staticmethod
+    def _normalize(parts) -> list:
+        """Accept whatever the caller naturally has.
+
+        The documented form is [(name, text)], but an agent holding readings in
+        a dict or a plain list is the common case, and both used to raise
+        `ValueError: too many values to unpack` from inside the join — observed
+        live, after which the agent gave up on Synthesizer entirely and
+        hand-rolled a prompt. Meeting the caller where it is costs four lines.
+        """
+        if isinstance(parts, dict):
+            return [(str(k), str(v)) for k, v in parts.items()]
+        out = []
+        for i, p in enumerate(parts):
+            if isinstance(p, (tuple, list)) and len(p) == 2:
+                out.append((str(p[0]), str(p[1])))
+            else:
+                out.append((f"source_{i}", str(p)))
+        return out
+
+    async def __call__(self, query=None, parts=None) -> str:
+      # `synth(parts)` is what callers reach for first — the query is often
+      # implicit in the lens prompt. Observed live: an agent burned three turns
+      # on the arity and then abandoned Synthesizer for a hand-rolled prompt.
+      # One positional arg means it IS the parts.
+      if parts is None:
+          query, parts = "", query
+      if parts is None:
+          return "NOT_FOUND (synthesizer: nothing to combine)"
+      parts = self._normalize(parts)
       with trace.span("synth", self.name, n=len(parts)):
         blocks = "\n\n".join(f"<from source='{n}'>\n{t}\n</from>" for n, t in parts)
+        user = f"Query: {query}\n\n{blocks}" if query else blocks
         resp = await _batch([[SystemMessage(content=self.prompt),
-                              HumanMessage(content=f"Query: {query}\n\n{blocks}")]],
+                              HumanMessage(content=user)]],
                             max_tokens=self.max_tokens)
         return _content(resp[0]) if resp else "NOT_FOUND"
 
@@ -200,9 +241,15 @@ async def fanout(chunks: Sequence[Content], query: str, *,
     when you want N sub-calls and will fold them yourself."""
     if not chunks:
         return []
+    # A list of Neurons is the natural thing to fan out over, and passing them
+    # here used to fall through to str-interpolation of the dataclass repr —
+    # it "worked" while silently discarding each neuron's own lens. Dispatch
+    # properly instead: a Neuron brings its own prompt, anything else uses the
+    # shared one.
+    msgs = [c.instruct_msgs(query) if isinstance(c, Neuron)
+            else _messages(c, query, prompt) for c in chunks]
     with trace.span("fanout", f"{len(chunks)} chunks", n=len(chunks)):
-        resps = await _batch([_messages(c, query, prompt) for c in chunks],
-                             max_tokens=max_tokens)
+        resps = await _batch(msgs, max_tokens=max_tokens)
         return [_content(r) for r in resps]
 
 

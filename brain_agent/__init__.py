@@ -15,7 +15,7 @@ module: PyShell and Kernel import with the standard library alone.
 import importlib
 from typing import TYPE_CHECKING
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 _EXPORTS = {
     # canonical heaven brain (the substrate everything extends) — needs heaven

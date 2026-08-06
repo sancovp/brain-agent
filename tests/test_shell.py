@@ -56,6 +56,25 @@ def test_print_survives_patched_builtins():
     print("ok  patched_print     agent output captured despite a hostile builtins.print")
 
 
+def test_fence_extraction():
+    """The cell parser decides WHAT gets executed, so its failure mode is
+    'ran the wrong text' rather than an error. Pin every shape."""
+    from brain_agent.shell import _extract_code as ex
+    F = "`" * 3
+    assert ex(f"{F}python\nx=1\n{F}") == "x=1"
+    assert ex(f"sure:\n{F}py\nx=2\n{F}") == "x=2"
+    assert ex(f"{F}\nx=3\n{F}") == "x=3"
+    # an illustrative non-python block must not be executed
+    assert ex(f"eg:\n{F}text\nNOT CODE\n{F}\nnow:\n{F}python\nx=4\n{F}") == "x=4"
+    # several cells: the last one is the model's committed answer
+    assert ex(f"{F}python\nold=1\n{F}\nbetter:\n{F}python\nx=5\n{F}") == "x=5"
+    # an unterminated fence must NOT execute the trailing prose
+    assert ex(f"here:\n{F}python\nx=6 and then prose") is None
+    assert ex("no fence here at all") is None
+    print("ok  fence_parser      python/py/untagged, ignores non-python, last cell wins,"
+          " unterminated -> None")
+
+
 def _cli(*args):
     """Drive the kernel from a genuinely separate PROCESS — the whole point."""
     r = subprocess.run([sys.executable, "-m", "brain_agent.kernel", *args],
@@ -99,6 +118,7 @@ def test_getvar_pulls_large_final():
 
 if __name__ == "__main__":
     test_pyshell_mechanics()
+    test_fence_extraction()
     test_print_survives_patched_builtins()
     test_kernel_state_outlives_the_caller()
     test_getvar_pulls_large_final()

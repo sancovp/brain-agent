@@ -224,3 +224,24 @@ node records the scores it produced, a `brain` node how many neurons opened.
 - `Brain.query` runs opened files and sub-brains concurrently.
 - `sub_rlm` awaits its child, but `asyncio.gather` (exposed in the shell as
   `gather`) runs several children at once — each on its **own** kernel.
+
+## Lenses (v0.7.0)
+
+A neuron's `prompt=` is its **lens** — what it reports and what it ignores. Give
+the same content different lenses to get readings that cannot contaminate each
+other, then fold them with a `Synthesizer` whose prompt controls the form:
+
+```python
+lenses = {"legal":    "Report ONLY legal risk. Ignore money and dates.",
+          "money":    "Report ONLY amounts and payment terms.",
+          "timeline": "Report ONLY dates and durations."}
+ns = [Neuron(content=doc, name=k, prompt=v) for k, v in lenses.items()]
+reads = await fanout(ns, "review this contract")     # each keeps its own lens
+report = await Synthesizer(prompt="Return JSON with keys legal, money, timeline.")(
+    dict(zip(lenses, reads)))
+```
+
+`cognize_prompt=` is the separate routing lens (how a neuron scores its own
+relevance). Lens *separation quality* tracks lens prompt quality: one-line
+lenses ground correctly but partition weakly; a lens that names what to ignore
+partitions cleanly.
