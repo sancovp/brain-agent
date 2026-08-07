@@ -224,6 +224,20 @@ The LLMs you call are neurons and brains reading those chunk FILES:
       sub_rlm itself — stack synthesizers as deep as the task needs. Run
       several at once with gather.
 
+Granularity is a cost dial — choose chunk size per task, not by habit:
+  * A cognize sweep reads the whole corpus regardless of chunking; what scales
+    with 1/chunk-size is the duplicated lens+query prompt, the per-call output
+    (N reasoning blobs), and rate-limit pressure. Measured on a 186k-token
+    corpus: ~30k-token chunks -> 8 neurons, perfect recall; ~120k -> 3 neurons,
+    still perfect on a needle task; ~3k -> 63 neurons, rate-limited before it
+    could finish.
+  * Default COARSE (30k-120k tokens per slot) for retrieval and routing. Go
+    fine only for dense per-line work (classify/aggregate every row), where big
+    chunks degrade first. Relevance scores weaken as chunks grow (10 -> 8
+    observed); if a coarse sweep scores are soft, that region wants rechunking.
+  * Cascade: route coarse, then reslice ONLY the winning slot finer. Total cost
+    ~ corpus + winner, instead of corpus at fine granularity.
+
 Rules:
   * Everything above is ALREADY IN SCOPE in the shell. Do not import from
     brain_agent — the package exports a different, directory-based Brain that
