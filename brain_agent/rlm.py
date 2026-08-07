@@ -179,7 +179,10 @@ class RLM:
                 verdict = "not_applicable"
             if verdict != "not_applicable" and not witness.strip():
                 verdict = "not_applicable"
+            # d is {} when the reply had no parseable JSON — record that as a
+            # parse failure, not as a finding of not_applicable.
             cells.append({"id": str(p.relative_to(self.root)), "verdict": verdict,
+                          "parse_failed": not d,
                           "score": _score(_content(resp))["score"],
                           "witness": witness,
                           "witness_verified": bool(witness) and witness in content,

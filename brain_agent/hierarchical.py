@@ -107,7 +107,15 @@ def _content(resp) -> str:
 
 
 def _score(raw: str) -> dict:
-    """Parse the first balanced JSON object; score 0-10 (bool→8/0)."""
+    """Parse the first balanced JSON object; score 0-10 (bool→8/0).
+
+    `parse_failed` distinguishes "the model scored this 0" from "the reply
+    could not be parsed". Conflating them poisons everything downstream: a
+    routing vote of 0 closes a branch as a VERDICT, a judge cell records
+    not_applicable as a FINDING, and a teaching loop learns from garbage —
+    when the truth in each case was "no data". Callers that route on score
+    alone still work (score stays 0); callers that care about honesty check
+    the flag."""
     start = raw.find("{")
     if start != -1:
         depth = 0
@@ -123,10 +131,12 @@ def _score(raw: str) -> dict:
                         if isinstance(s, bool):
                             s = 8 if s else 0
                         return {"score": max(0, min(10, int(s))),
-                                "reasoning": str(d.get("reasoning", ""))}
+                                "reasoning": str(d.get("reasoning", "")),
+                                "parse_failed": False}
                     except (json.JSONDecodeError, ValueError, TypeError):
                         break
-    return {"score": 0, "reasoning": f"unparseable: {raw[:80]}"}
+    return {"score": 0, "reasoning": f"unparseable: {raw[:80]}",
+            "parse_failed": True}
 
 
 COGNIZE_SYSTEM = ("You are a NeuronAgent. Score 0-10 how likely your neuron content "
@@ -222,7 +232,8 @@ class Brain:
         pad = "  " * self.depth
         for i, (n, v) in enumerate(zip(kids, votes)):
             kind = "BRAIN" if isinstance(n, Brain) else "file"
-            trace.append(f"{pad}[{'OPEN' if i in chosen else 'skip'} s={v['score']}] "
+            flag = " PARSE-FAILED" if v.get("parse_failed") else ""
+            trace.append(f"{pad}[{'OPEN' if i in chosen else 'skip'} s={v['score']}{flag}] "
                          f"{kind} {self.name}/{n.name}")
         related = [kids[i] for i in sorted(chosen)]
         # STAGE 2 — instruct: files batch as neuron calls; sub-brains recurse.

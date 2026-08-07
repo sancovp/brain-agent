@@ -200,7 +200,9 @@ class Brain:
             resps = await _batch([n.cognize_msgs(query) for n in self.neurons],
                                  max_tokens=700)
             votes = [_score(_content(r)) for r in resps]
-            sp.set(scores=[v["score"] for v in votes])
+            failed = sum(1 for v in votes if v.get("parse_failed"))
+            sp.set(scores=[v["score"] for v in votes],
+                   **({"parse_failed": failed} if failed else {}))
             return votes
 
     async def query(self, query: str, *, router: Optional[Callable] = None,
