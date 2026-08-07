@@ -84,8 +84,17 @@ class Neuron:
             return _content(resp[0]) if resp else "NOT_FOUND"
 
     async def cognize(self, query: str) -> dict:
-        resp = await _batch([self.cognize_msgs(query)], max_tokens=700)
-        return _score(_content(resp[0])) if resp else {"score": 0, "reasoning": "no response"}
+        # Reasoning models spend output tokens on thinking FIRST; when the
+        # thinking runs long, 700 yields zero text and the vote comes back
+        # parse_failed (observed intermittently live). One escalation retry
+        # costs nothing when the first try lands.
+        for mt in (700, 2800):
+            resp = await _batch([self.cognize_msgs(query)], max_tokens=mt)
+            v = _score(_content(resp[0])) if resp else {"score": 0, "reasoning": "no response",
+                                                        "parse_failed": True}
+            if not v.get("parse_failed"):
+                return v
+        return v
 
     async def __call__(self, query: str, **kw) -> str:
         return await self.instruct(query, **kw)
@@ -184,8 +193,13 @@ class Brain:
         return _messages(face, query, BRAIN_COGNIZE_SYSTEM)
 
     async def cognize(self, query: str) -> dict:
-        resp = await _batch([self.cognize_msgs(query)], max_tokens=700)
-        return _score(_content(resp[0])) if resp else {"score": 0, "reasoning": "no response"}
+        for mt in (700, 2800):                     # same escalation as Neuron
+            resp = await _batch([self.cognize_msgs(query)], max_tokens=mt)
+            v = _score(_content(resp[0])) if resp else {"score": 0, "reasoning": "no response",
+                                                        "parse_failed": True}
+            if not v.get("parse_failed"):
+                return v
+        return v
 
     async def instruct(self, query: str, **kw) -> str:
         return await self.query(query, **kw)

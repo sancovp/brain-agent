@@ -322,7 +322,21 @@ Rules:
 
 TASK_CONCEPTS_SYS = ("Extract 2-4 abstract CONCEPTS from the task as a JSON list "
                      "of lowercase snake_case strings (e.g. billing_dispute, "
-                     "data_privacy, video_production). JSON list only.")
+                     "data_privacy, video_production). If a KNOWN CONCEPTS list "
+                     "is provided, PREFER exact names from it; mint a new name "
+                     "only when nothing on the list fits. JSON list only.")
+
+
+def _norm_concept(c: str, known=()) -> str:
+    """Free-form extraction produces near-miss vocabulary — observed live:
+    run 1 taught edges from billing_dispute, run 2 stimulated with
+    billing_disputes; no path, nothing fired. Strip a plural s ONLY when the
+    singular is already a known concept — the unconditional version mangled
+    'analysis' into 'analysi'."""
+    c = c.strip().lower()
+    if c not in known and c.endswith("s") and c[:-1] in known:
+        return c[:-1]
+    return c
 
 
 @dataclass
@@ -384,14 +398,32 @@ class Orchestrator:
                 os.path.join(base, f"{self.kernel}-neuro.db"))
 
     def _graph(self):
+        """ONE ActivationGraph handle per DB path per process. Opening a fresh
+        kuzu.Database per call left writes in one handle's WAL invisible to the
+        next handle — a taught ref vanished between teach and the next view
+        (observed live; a separate-process read saw the write fine)."""
         from .neuro import ActivationGraph
         tdir, gpath = self._neuro_paths()
-        return ActivationGraph(gpath, reset=False)
+        cache = globals().setdefault("_GRAPH_CACHE", {})
+        if gpath not in cache:
+            cache[gpath] = ActivationGraph(gpath, reset=False)
+        return cache[gpath]
 
     def _transcript(self):
         from .context import ContextDict
         tdir, _ = self._neuro_paths()
         return ContextDict(tdir)
+
+    def _known_concepts(self) -> list:
+        try:
+            g = self._graph()
+            r = g.conn.execute("MATCH (c:Concept) WHERE c.kind = 'concept' RETURN c.name")
+            out = []
+            while r.has_next():
+                out.append(r.get_next()[0])
+            return sorted(out)
+        except Exception:
+            return []
 
     async def _task_concepts(self, task: str) -> list:
         """One tiny call maps the task into concept space. Failure -> [] (the
@@ -399,14 +431,37 @@ class Orchestrator:
         import json as _json
         from langchain_core.messages import SystemMessage, HumanMessage
         from .hierarchical import _batch, _content
-        try:
-            r = await _batch([[SystemMessage(content=TASK_CONCEPTS_SYS),
-                               HumanMessage(content=task)]], max_tokens=300)
-            raw = _content(r[0])
-            picked = _json.loads(raw[raw.index("["):raw.index("]") + 1])
-            return [c for c in picked if isinstance(c, str)][:4]
-        except Exception:
-            return []
+        # Reasoning models spend output tokens on THINKING before any text
+        # block appears; a fixed budget intermittently yields an empty reply
+        # and teaching silently skips (observed live twice, at 300 AND 1200).
+        # Escalate once before giving up.
+        known = self._known_concepts()
+        user = task if not known else             f"KNOWN CONCEPTS: {', '.join(known)}\n\nTASK: {task}"
+        for mt in (1200, 4000):
+            try:
+                r = await _batch([[SystemMessage(content=TASK_CONCEPTS_SYS),
+                                   HumanMessage(content=user)]], max_tokens=mt)
+                raw = _content(r[0])
+                picked = _json.loads(raw[raw.index("["):raw.index("]") + 1])
+                out = [_norm_concept(c, known) for c in picked if isinstance(c, str)][:4]
+                if out:
+                    return out
+            except Exception:
+                continue
+        # Deterministic fallback: the model path flaked twice in a row live and
+        # teaching silently starved. Lexical stimulus is degraded, not dead —
+        # and the known-concepts preference upgrades vocabulary over time.
+        stop = {"the", "and", "for", "with", "what", "which", "have", "this",
+                "that", "from", "slot", "context", "one", "line", "set", "final",
+                "already", "task", "answer"}
+        words = [w.strip(".,!?`'\"()[]:;").lower() for w in task.split()]
+        cands = [w for w in words if len(w) > 3 and w not in stop and w.isalpha()]
+        seen, out = set(), []
+        for w in cands:
+            n = _norm_concept(w, known)
+            if n not in seen:
+                seen.add(n); out.append(n)
+        return out[:3]
 
     async def _membrane_view(self, task: str) -> str:
         """Prior runs as boxed refs; activation decides what discloses."""
@@ -434,6 +489,10 @@ class Orchestrator:
         return ref
 
     async def _teach_after_run(self, task: str) -> None:
+        with trace.span("teach", task[:80]) as _sp:
+            await self._teach_inner(task, _sp)
+
+    async def _teach_inner(self, task: str, _sp) -> None:
         """cognize sets the weights: score each transcript ref against the task
         and anneal amplitudes + stimulus edges. parse_failed votes are dropped —
         a teaching loop that learns from garbage anneals garbage."""
@@ -448,6 +507,8 @@ class Orchestrator:
         votes = await aio.gather(*(n.cognize(task) for n in neurons))
         lesson = {r: v["score"] for r, v in zip(refs, votes)
                   if not v.get("parse_failed")}
+        _sp.set(concepts=concepts, lesson=lesson,
+                parse_failed=sum(1 for v in votes if v.get("parse_failed")))
         if lesson:
             g = self._graph()
             for c in concepts:
