@@ -320,14 +320,28 @@ Rules:
     setting FINAL in the shell.
 """
 
+TASK_CONCEPTS_SYS = ("Extract 2-4 abstract CONCEPTS from the task as a JSON list "
+                     "of lowercase snake_case strings (e.g. billing_dispute, "
+                     "data_privacy, video_production). JSON list only.")
+
+
 @dataclass
 class Orchestrator:
-    """One agent, one runtime context, no turn cap."""
+    """One agent, one runtime context, no turn cap.
+
+    membrane=True (needs the optional kuzu dep) puts the slinky membrane on the
+    MAIN agent context: every prior run of this kernel is a boxed ref; a
+    numeric activation pass over the kernel's concept graph decides which refs
+    disclose into the prompt; after each run, cognize TEACHES the graph
+    (gauge->amplitude), so disclosure anneals from lexical-blind to semantic."""
     kernel: str = "rlm"
     reset: bool = False
     max_tool_calls: int = UNBOUNDED_TOOL_CALLS
     model: Optional[str] = None
     system_prompt: str = SYSTEM
+    membrane: bool = True
+    view_budget: int = 6000
+    teach: bool = True
     _bound: dict = field(default_factory=dict)
 
     def __post_init__(self):
@@ -362,6 +376,84 @@ class Orchestrator:
             self._bound[name] = type(value).__name__
         return self
 
+    # ── the membrane on the main context ─────────────────────────────────────
+
+    def _neuro_paths(self):
+        base = os.path.join(os.environ.get("BRAIN_CONTEXT_DIR", "/tmp/brain-contexts"))
+        return (os.path.join(base, f"{self.kernel}-transcript"),
+                os.path.join(base, f"{self.kernel}-neuro.db"))
+
+    def _graph(self):
+        from .neuro import ActivationGraph
+        tdir, gpath = self._neuro_paths()
+        return ActivationGraph(gpath, reset=False)
+
+    def _transcript(self):
+        from .context import ContextDict
+        tdir, _ = self._neuro_paths()
+        return ContextDict(tdir)
+
+    async def _task_concepts(self, task: str) -> list:
+        """One tiny call maps the task into concept space. Failure -> [] (the
+        membrane then shows everything boxed, which is still useful)."""
+        import json as _json
+        from langchain_core.messages import SystemMessage, HumanMessage
+        from .hierarchical import _batch, _content
+        try:
+            r = await _batch([[SystemMessage(content=TASK_CONCEPTS_SYS),
+                               HumanMessage(content=task)]], max_tokens=300)
+            raw = _content(r[0])
+            picked = _json.loads(raw[raw.index("["):raw.index("]") + 1])
+            return [c for c in picked if isinstance(c, str)][:4]
+        except Exception:
+            return []
+
+    async def _membrane_view(self, task: str) -> str:
+        """Prior runs as boxed refs; activation decides what discloses."""
+        from .neuro import Membrane
+        t = self._transcript()
+        if not t:
+            return ""
+        store = {ref: (body.splitlines()[0][:110], body) for ref, body in t.items()}
+        m = Membrane(store)
+        g = self._graph()
+        concepts = await self._task_concepts(task)
+        if concepts:
+            for c in concepts:
+                g.add(c, "concept", 0.5)
+            fired = [n for n, _ in g.disclose({c: 1.0 for c in concepts},
+                                              budget=3)]
+            m.set_firing(fired)
+        self._last_stimulus = concepts
+        return m.render(char_budget=self.view_budget)
+
+    def _record_run(self, task: str, answer: str) -> str:
+        t = self._transcript()
+        ref = f"run_{len(t):03d}"
+        t[ref] = f"TASK: {task}" + chr(10)*2 + f"ANSWER: {answer}"
+        return ref
+
+    async def _teach_after_run(self, task: str) -> None:
+        """cognize sets the weights: score each transcript ref against the task
+        and anneal amplitudes + stimulus edges. parse_failed votes are dropped —
+        a teaching loop that learns from garbage anneals garbage."""
+        from .sdk import Neuron
+        import asyncio as aio
+        concepts = getattr(self, "_last_stimulus", None) or             await self._task_concepts(task)
+        if not concepts:
+            return
+        t = self._transcript()
+        refs = sorted(t)[-8:]                     # bound the lesson size
+        neurons = [Neuron(content=t[r], name=r) for r in refs]
+        votes = await aio.gather(*(n.cognize(task) for n in neurons))
+        lesson = {r: v["score"] for r, v in zip(refs, votes)
+                  if not v.get("parse_failed")}
+        if lesson:
+            g = self._graph()
+            for c in concepts:
+                g.add(c, "concept", 0.5)
+            g.teach({c: 1.0 for c in concepts}, lesson)
+
     def exec(self, code: str) -> str:
         return self.k.exec(code)
 
@@ -387,14 +479,32 @@ class Orchestrator:
             temperature=0.2,
             max_tokens=8000,
         )
-        with trace.span("orchestrator", task[:120], kernel=self.kernel):
+        view = ""
+        if self.membrane:
+            try:
+                view = await self._membrane_view(task)
+            except ImportError:
+                view = ""                          # kuzu absent: run unmembraned
+        prompt = (f"PRIOR WORK (membrane — boxed [\U0001F4E6] refs are folded; "
+                  f"their bodies live in the transcript store):\n{view}\n\n"
+                  f"Task: {task}") if view else task
+        with trace.span("orchestrator", task[:120], kernel=self.kernel,
+                        membrane=bool(view)):
             agent = BaseHeavenAgent(config, UnifiedChat(),
                                     max_tool_calls=self.max_tool_calls)
-            result = await agent.run(prompt=task)
+            result = await agent.run(prompt=prompt)
         # FINAL lives in the kernel, so the answer is not bounded by the
         # model's output window; the reply text is the fallback.
         final = self.k.getvar("FINAL")
-        return final if final is not None else _final_text(result)
+        answer = final if final is not None else _final_text(result)
+        if self.membrane:
+            try:
+                self._record_run(task, answer)
+                if self.teach:
+                    await self._teach_after_run(task)
+            except ImportError:
+                pass
+        return answer
 
 
 def _message_text(msg: Any) -> str:

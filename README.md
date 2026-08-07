@@ -265,3 +265,16 @@ the agent's brain, and **subdirectories are already sub-brains** — so every
 composition is a smaller, more specialized nested brain, and specialization
 accrues with work. CLI: `python -m brain_agent.my_brain AGENT "purpose"
 [--seed n=file] [--query q]`.
+
+## Neuromorphic context (v0.13.0)
+
+The main agent context is now a **membrane** over a persistent activation
+graph (`pip install brain-agent[neuro]`, local kuzu). Every prior run of a
+kernel is a boxed ref (`[📦 run_007] TASK: …`); a numeric spreading-activation
+pass — ~100ms, zero tokens — decides which refs disclose into the prompt; and
+after each run, cognize **teaches** the graph (`gauge → amplitude` annealing,
+EMA so one outlier lesson never erases five good ones; `parse_failed` votes
+are dropped so the loop never learns from garbage). Disclosure competes under
+a softmax forced by the view budget; a fired ref that no longer fits demotes
+to its box rather than truncating. Routing anneals from LLM-taught to purely
+numeric: sub-symbolic routing, symbolic reading.
