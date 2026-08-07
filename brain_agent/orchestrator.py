@@ -71,6 +71,69 @@ async def shell_func(code: str, kernel: Optional[str] = None) -> str:
     return out
 
 
+# ── registry + routing, module level (the kernel bootstrap delegates here) ────
+
+def _brain_registry() -> dict:
+    """The on-disk registry JSON — the only machine-readable surface (this
+    heaven's registry_util_func formats every operation into display strings)."""
+    import json
+    from heaven_base.utils.get_env_value import EnvConfigUtil
+    path = os.path.join(EnvConfigUtil.get_heaven_data_dir(), "registry",
+                        "brain_configs_registry.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _registry_brain_dir(name: str):
+    from pathlib import Path
+    entries = _brain_registry()
+    if name not in entries:
+        raise KeyError(f"brain {name!r} not registered")
+    cfg = entries[name]
+    cfg = cfg.get("value_dict", cfg) if isinstance(cfg, dict) else cfg
+    src = cfg.get("neuron_source") or cfg.get("directory")
+    if not os.path.isabs(src):
+        from heaven_base.utils.get_env_value import EnvConfigUtil
+        src = os.path.join(EnvConfigUtil.get_heaven_data_dir(), src)
+    return Path(src)
+
+
+def _registry_load_brain(name: str, router=None):
+    from .sdk import from_dir
+    src = _registry_brain_dir(name)
+    b = from_dir(src, router=router, name=name)
+    b.dir = src
+    return b
+
+
+async def _route_over_registry(task: str, k: int = 3, digest: bool = True) -> list:
+    """Rank registered brains for a task: gauge (each brain cognizing its own
+    fitness through its face) blended with the bandit record. Builds missing
+    faces first — an empty face gauges 0 regardless of fit (observed)."""
+    import asyncio
+    from . import bandit
+    names = sorted(_brain_registry())
+    if not names:
+        return []
+    brains = [_registry_load_brain(n) for n in names]
+    if digest:
+        from .hierarchical import build_digests
+        for b in brains:
+            if b.digest is None:
+                await build_digests(b.dir)
+        brains = [_registry_load_brain(n) for n in names]
+    votes = await asyncio.gather(*(b.cognize(task) for b in brains))
+    rows = []
+    for n, v in zip(names, votes):
+        st = bandit.stats(n)
+        rows.append((n, bandit.blend(v["score"], n), v["score"],
+                     st["pulls"], st["mean"]))
+    rows.sort(key=lambda r: r[1], reverse=True)
+    return rows[:k]
+
+
 def _build_tool_classes():
     """Built lazily so this module imports without heaven present."""
     from heaven_base import BaseHeavenTool, ToolArgsSchema
@@ -125,39 +188,15 @@ FINAL = None
 
 # existing brains: the brain_configs registry the original BrainAgent uses
 
-def _brain_registry():
-    # Read the registry FILE. This heaven version formats every registry_util
-    # operation (get and get_all alike) into a display string, so the on-disk
-    # JSON is the only machine-readable surface.
-    import json, os
-    from heaven_base.utils.get_env_value import EnvConfigUtil
-    path = os.path.join(EnvConfigUtil.get_heaven_data_dir(), "registry",
-                        "brain_configs_registry.json")
-    if not os.path.exists(path):
-        return {}
-    with open(path, encoding="utf-8") as fh:
-        return json.load(fh)
-
-
 def list_brains():
     "Names of every registered brain."
+    from brain_agent.orchestrator import _brain_registry
     return sorted(_brain_registry())
 
 def load_brain(name, router=None):
     "A REGISTERED brain as a composable Brain value (usable as a neuron)."
-    import os
-    entries = _brain_registry()
-    if name not in entries:
-        raise KeyError(f"brain {name!r} not registered; see list_brains()")
-    cfg = entries[name]
-    cfg = cfg.get("value_dict", cfg) if isinstance(cfg, dict) else cfg
-    src = cfg.get("neuron_source") or cfg.get("directory")
-    if not os.path.isabs(src):
-        from heaven_base.utils.get_env_value import EnvConfigUtil
-        src = os.path.join(EnvConfigUtil.get_heaven_data_dir(), src)
-    b = from_dir(src, router=router, name=name)
-    b.dir = Path(src)          # so route() can build a missing face
-    return b
+    from brain_agent.orchestrator import _registry_load_brain
+    return _registry_load_brain(name, router=router)
 
 def register_brain(directory, brain_name, chunk_size=-1):
     from brain_agent.brain_agent import register_brain as _rb
@@ -166,32 +205,11 @@ def register_brain(directory, brain_name, chunk_size=-1):
 # the brain-of-brains: routing = cognize over the registry, tempered by record
 
 async def route(task, k=3):
-    "Rank registered brains for a task. Gauge = each brain cognizing its own"
-    "fitness through its digest face; blended with the bandit record. Returns"
-    "[(name, blended, gauge, pulls, mean)] best-first. Soft scores across the"
-    "board mean NO specialist exists — design one and register_brain it."
-    import brain_agent.bandit as bandit
-    names = list_brains()
-    if not names:
-        return []
-    brains = [load_brain(n) for n in names]
-    # A brain with no _digest.md cognizes over a placeholder string and scores
-    # 0 no matter how good the fit — an empty face makes routing blind
-    # (observed: two perfectly relevant brains both gauged 0). Build missing
-    # faces once; the fold is amortized across every future route.
-    for b in brains:
-        if b.digest is None:
-            await build_digests(b.dir)
-    brains = [load_brain(n) for n in names]
-    votes = await gather(*(b.cognize(task) for b in brains))
-    rows = []
-    for n, v in zip(names, votes):
-        st = bandit.stats(n)
-        rows.append((n, bandit.blend(v["score"], n), v["score"],
-                     st["pulls"], st["mean"]))
-    rows.sort(key=lambda r: r[1], reverse=True)
-    return rows[:k]
+    "Rank registered brains for this task: gauge blended with record."
+    from brain_agent.orchestrator import _route_over_registry
+    return await _route_over_registry(task, k=k)
 
+from brain_agent.my_brain import my_brain as my_brain, compose as compose, bound_brain as bound_brain
 
 def reward(brain, value, source="caller", note=""):
     "Record a HANDLER-grade outcome (0-1) for a brain: a witnessed judge"
@@ -267,6 +285,10 @@ The LLMs you call are neurons and brains reading those chunk FILES:
       its RECORD (the bandit ledger). Use the winner. If every score is soft,
       no specialist exists — DESIGN one (engineer CONTEXT, register_brain) and
       it becomes a new arm.
+  await my_brain(agent, task=...)  the agent's OWN brain: existing binding,
+      best registry fit, or a newborn (charter + seed, digested, registered,
+      bound). await compose(agent, name, {slots}) writes a composition as a
+      SUB-BRAIN under it — specialization accrues by composition.
   reward(name, value, source=..., note=...)
       record how a brain actually performed, 0-1 — from a witnessed judge
       verdict or the caller's acceptance, NEVER from a brain's own confidence.

@@ -245,3 +245,23 @@ neurons/brains reading the slot files → write results back as new slots →
 reslice and relens until satisfied → set `FINAL`. Slots survive kernel restarts
 (chunk files re-adopt on boot), `bind()` places values into slots, and `FINAL`
 is retrieved from the kernel so the answer is not bounded by the model's reply.
+
+## my_brain — every agent gets ITS brain (v0.12.0)
+
+The endgame contract, as a skill any LLM can call (`.claude/skills/my-brain`):
+
+```python
+b = await my_brain("research-dept", task="qualify leads against the ICP")
+answer = await b.query("does ACME fit tier A?")
+await compose("research-dept", "acme_review", {"verdict": ..., "evidence": ...})
+```
+
+First call routes the agent's purpose over the registered brains — binding
+requires BOTH a blended fit and a minimum gauge (the bandit record is
+task-agnostic; relevance is the gauge's job) — or births a new brain: charter +
+seed slots, digested, registered, bound. Later calls return the same brain:
+identity, not per-call routing. Compositions are written as subdirectories of
+the agent's brain, and **subdirectories are already sub-brains** — so every
+composition is a smaller, more specialized nested brain, and specialization
+accrues with work. CLI: `python -m brain_agent.my_brain AGENT "purpose"
+[--seed n=file] [--query q]`.
