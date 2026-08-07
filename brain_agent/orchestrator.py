@@ -116,6 +116,13 @@ from brain_agent.sdk import (Neuron, Synthesizer, Brain, fanout, sub_llm,
 from brain_agent.hierarchical import Brain as DigestBrain
 from brain_agent.hierarchical import build_digests as build_digests
 
+# THE state dict: context slots, each persisted to a chunk file on write
+from brain_agent.context import ContextDict
+import os as _os
+CONTEXT = ContextDict(_os.path.join(
+    _os.environ.get("BRAIN_CONTEXT_DIR", "/tmp/brain-contexts"), __kernel_name__))
+FINAL = None
+
 # existing brains: the brain_configs registry the original BrainAgent uses
 
 def _brain_registry():
@@ -172,78 +179,62 @@ async def sub_rlm(task, bind=None, kernel=None):
             child.bind(**bind)
         return await child.run(task)
 """
-SYSTEM = """You are a synthesizer that builds and runs brain systems.
+SYSTEM = """You are a synthesizer agent. You run a Recursive Language Model.
 
-You have ONE persistent runtime context, reached with ShellTool. Everything you
-make there stays alive: variables, functions, neurons, brains, whole systems.
-Results pipe between them as live Python values — they never have to pass back
-through you as text.
+Your working memory is CONTEXT — a state dict in your persistent Python shell
+(ShellTool). Each slot is a chunk of context, persisted to a file the moment
+you set it. You never hold the material yourself; you ENGINEER it:
 
-What you build with (already in scope — do NOT import from brain_agent, the
-package exports a different, directory-based Brain that would shadow these):
+  THE LOOP
+  1. Get material into CONTEXT slots: CONTEXT["a"] = text, or slice an
+     existing slot into smaller ones. Inspect with print(CONTEXT.slots()).
+  2. Make vars and PIPE them: call neurons/brains ON slot files, hold results
+     in vars, write what matters back into new slots.
+  3. Repeat — reslice, relens, rebuild — until you are satisfied.
+  4. FINAL = the answer. That ends the work; FINAL is returned from the shell,
+     so its length is not limited by your reply.
 
-  Neuron(content=..., name=..., prompt=...)
-      One chunk of context read through a LENS. `prompt=` IS the lens: it
-      decides what this neuron reports and what it ignores. The same content
-      under different lenses gives independent readings that cannot contaminate
-      each other. `cognize_prompt=` is the separate lens it uses to score its
-      own relevance. `await n(query)` reads it.
+The LLMs you call are neurons and brains reading those chunk FILES:
 
-  Synthesizer(prompt=...)
-      Folds readings into one result; `prompt=` controls the form (JSON, a
-      table, a ranking). `await synth(parts)` where parts is a dict
-      {name: text}, a list of (name, text), or a list of strings.
-
+  Neuron(content=CONTEXT.path("a"), name=..., prompt=...)
+      one slot read through a LENS. prompt= IS the lens — what to report,
+      what to ignore. Same slot + different lenses = independent readings.
+      cognize_prompt= is its self-relevance lens. await n(query) reads it.
+  Synthesizer(prompt=...)          folds readings: await synth(parts) where
+      parts is a dict {name: text}, list of (name, text), or list of strings.
   Brain(neurons=[...], synthesizer=..., router=...)
-      N neurons + 1 synthesizer. A Brain is itself usable AS a neuron, so
-      brains nest into systems of any depth. `await brain.query(q)` runs it;
-      `await brain.vote(q)` returns raw relevance scores if you want to route
-      it yourself. Routers are plain callables (query, votes, neurons) -> list
-      of indices; open_all_router / top_k_router(k, threshold) /
-      threshold_router(t) are there if you want them, and writing your own is
-      normal.
-
-  await fanout(items, query)     N calls at once. Items may be Neurons (each
-                                 keeps its own lens) or raw content.
-  await sub_llm(prompt, content) one call.
-  await gather(...)              run anything concurrently, including whole
-                                 brains — as many at once as you want.
-  from_dir(path)                 build a Brain from a directory tree.
-  list_brains() / load_brain(name)
-                                 the registry of EXISTING brains. load_brain
-                                 returns a Brain value: query it directly, or
-                                 stack it as a neuron inside a brain you build.
-  register_brain(directory, name)
-                                 register a directory as a reusable brain.
+      N neurons + 1 synthesizer; a Brain is usable AS a neuron, so systems
+      nest. await brain.query(q); await brain.vote(q) for raw scores; routers
+      are plain callables and writing your own is normal.
+  CONTEXT.brain()                  the whole CONTEXT as a brain — every slot a
+      neuron. Cognize/judge your own working context.
+  await fanout(items, query)       N calls at once (Neurons keep their lenses).
+  await sub_llm(prompt, content)   one call.
+  await gather(...)                anything concurrently, including brains.
+  from_dir(path)                   a directory tree as a brain.
+  list_brains() / load_brain(name) the registry of EXISTING brains; a loaded
+      brain is a value — query it or stack it as a neuron.
+  register_brain(directory, name)  register a reusable brain (CONTEXT.dir
+      works: your engineered context can become a permanent brain).
   DigestBrain(Path(dir)) / await build_digests(Path(dir))
-                                 the hierarchical digest-pyramid brain for BIG
-                                 corpora: build_digests folds a directory tree
-                                 into _digest.md router faces once, then
-                                 DigestBrain(root).query(q) descends it with
-                                 witnessed synthesis. Prefer it over hand-made
-                                 neurons when the corpus is a large tree.
-  await sub_rlm(task, bind={...})
-                                 delegate to ANOTHER synthesizer agent with its
-                                 own runtime context; returns its answer. It can
-                                 build brains and call sub_rlm itself, so
-                                 synthesizers stack. Run several at once with
-                                 gather.
+      the digest-pyramid brain for BIG corpora: fold once, then witnessed
+      descent. Prefer it over hand-made neurons for large trees.
+  await sub_rlm(task, bind={...})  ANOTHER synthesizer agent with its own
+      shell and its own CONTEXT; bind puts values into its slots. It can call
+      sub_rlm itself — stack synthesizers as deep as the task needs. Run
+      several at once with gather.
 
-How to work:
-
-  * Make the system the problem actually needs. Chunk the material, choose the
-    lenses, decide how many neurons, compose them into brains, nest brains into
-    larger systems. Build it on the fly and rebuild it when it is wrong.
-  * Call whatever you want, whenever you want, as many at once as you want.
-    There is no turn limit. You decide when the answer is good enough.
-  * Never re-run work you have already done — assign it to a variable and reuse
-    it. The context persists across every call.
-  * Keep large data in variables, not in your own context. Print conclusions,
-    not corpora. Tool output is truncated; the variable is not.
-  * When you are satisfied, give the final answer in your reply. If it is large,
-    also leave it in a variable and say which one.
+Rules:
+  * Everything above is ALREADY IN SCOPE in the shell. Do not import from
+    brain_agent — the package exports a different, directory-based Brain that
+    would shadow yours.
+  * The shell PERSISTS between calls. Never re-run a neuron, fanout, or brain
+    you already ran — its result is in a var or a slot; reuse it.
+  * Print conclusions and CONTEXT.slots(), never whole chunks. Tool output is
+    truncated for you; slots and vars are not.
+  * You decide when the answer is good enough. There is no turn limit. End by
+    setting FINAL in the shell.
 """
-
 
 @dataclass
 class Orchestrator:
@@ -267,8 +258,10 @@ class Orchestrator:
             self.k.exec(BOOTSTRAP)
 
     def bind(self, **objects: Any) -> "Orchestrator":
-        """Put values into the runtime context by name. Large strings go via a
-        file so they are never sent through a socket payload twice."""
+        """Put values into CONTEXT slots by name. Large strings travel via a
+        file so they never ride a socket payload twice. Raises on kernel
+        errors — a bind that silently fails leaves the agent working on
+        context that is not there (observed)."""
         import json
         import tempfile
         for name, value in objects.items():
@@ -276,9 +269,12 @@ class Orchestrator:
                 p = os.path.join(tempfile.gettempdir(), f"brain-bind-{self.kernel}-{name}.txt")
                 with open(p, "w", encoding="utf-8", errors="replace") as fh:
                     fh.write(value)
-                self.k.exec(f"{name} = Path({p!r}).read_text(errors='replace')\n")
+                out = self.k.exec(f"CONTEXT[{name!r}] = Path({p!r}).read_text(errors='replace')\n")
             else:
-                self.k.exec(f"{name} = {json.dumps(value) if not isinstance(value, str) else repr(value)}\n")
+                lit = repr(value) if isinstance(value, str) else json.dumps(value)
+                out = self.k.exec(f"CONTEXT[{name!r}] = {lit}\n")
+            if "Error" in out or "Traceback" in out:
+                raise RuntimeError(f"bind({name!r}) failed in kernel: {out[:300]}")
             self._bound[name] = type(value).__name__
         return self
 
@@ -311,7 +307,10 @@ class Orchestrator:
             agent = BaseHeavenAgent(config, UnifiedChat(),
                                     max_tool_calls=self.max_tool_calls)
             result = await agent.run(prompt=task)
-        return _final_text(result)
+        # FINAL lives in the kernel, so the answer is not bounded by the
+        # model's output window; the reply text is the fallback.
+        final = self.k.getvar("FINAL")
+        return final if final is not None else _final_text(result)
 
 
 def _message_text(msg: Any) -> str:

@@ -224,3 +224,24 @@ report = await Synthesizer(prompt="Return JSON with keys legal, money, timeline.
 relevance). Lens *separation quality* tracks lens prompt quality: one-line
 lenses ground correctly but partition weakly; a lens that names what to ignore
 partitions cleanly.
+
+## CONTEXT — the state dict (v0.10.0)
+
+The synthesizer agent's working memory is `CONTEXT`, a state dict in its shell.
+Each slot is a chunk of context, persisted to a file the moment it is set — and
+neurons read files, so a slot is directly callable context. A directory of slot
+files is a brain, so `CONTEXT.brain()` turns the working context itself into
+one, and `register_brain(CONTEXT.dir, name)` makes it permanent.
+
+```python
+CONTEXT["contract_a"] = chunk               # persisted to <ctx>/contract_a.md
+n = Neuron(content=CONTEXT.path("contract_a"), prompt="Report only risk.")
+CONTEXT["risk_a"] = await n("review")       # results become context too
+FINAL = report                              # ends the work; returned unbounded
+```
+
+The instructed loop: get material into slots → make vars and pipe them through
+neurons/brains reading the slot files → write results back as new slots →
+reslice and relens until satisfied → set `FINAL`. Slots survive kernel restarts
+(chunk files re-adopt on boot), `bind()` places values into slots, and `FINAL`
+is retrieved from the kernel so the answer is not bounded by the model's reply.
