@@ -155,11 +155,50 @@ def load_brain(name, router=None):
     if not os.path.isabs(src):
         from heaven_base.utils.get_env_value import EnvConfigUtil
         src = os.path.join(EnvConfigUtil.get_heaven_data_dir(), src)
-    return from_dir(src, router=router, name=name)
+    b = from_dir(src, router=router, name=name)
+    b.dir = Path(src)          # so route() can build a missing face
+    return b
 
 def register_brain(directory, brain_name, chunk_size=-1):
     from brain_agent.brain_agent import register_brain as _rb
     return _rb(directory, brain_name, chunk_size)
+
+# the brain-of-brains: routing = cognize over the registry, tempered by record
+
+async def route(task, k=3):
+    "Rank registered brains for a task. Gauge = each brain cognizing its own"
+    "fitness through its digest face; blended with the bandit record. Returns"
+    "[(name, blended, gauge, pulls, mean)] best-first. Soft scores across the"
+    "board mean NO specialist exists — design one and register_brain it."
+    import brain_agent.bandit as bandit
+    names = list_brains()
+    if not names:
+        return []
+    brains = [load_brain(n) for n in names]
+    # A brain with no _digest.md cognizes over a placeholder string and scores
+    # 0 no matter how good the fit — an empty face makes routing blind
+    # (observed: two perfectly relevant brains both gauged 0). Build missing
+    # faces once; the fold is amortized across every future route.
+    for b in brains:
+        if b.digest is None:
+            await build_digests(b.dir)
+    brains = [load_brain(n) for n in names]
+    votes = await gather(*(b.cognize(task) for b in brains))
+    rows = []
+    for n, v in zip(names, votes):
+        st = bandit.stats(n)
+        rows.append((n, bandit.blend(v["score"], n), v["score"],
+                     st["pulls"], st["mean"]))
+    rows.sort(key=lambda r: r[1], reverse=True)
+    return rows[:k]
+
+
+def reward(brain, value, source="caller", note=""):
+    "Record a HANDLER-grade outcome (0-1) for a brain: a witnessed judge"
+    "verdict or explicit acceptance. Never reward a brain with its own gauge."
+    import brain_agent.bandit as bandit
+    return bandit.record(brain, value, source=source, note=note)
+
 
 # recursion: another synthesizer AGENT as a callable
 
@@ -223,6 +262,15 @@ The LLMs you call are neurons and brains reading those chunk FILES:
       shell and its own CONTEXT; bind puts values into its slots. It can call
       sub_rlm itself — stack synthesizers as deep as the task needs. Run
       several at once with gather.
+  await route(task)                rank the registered brains for this task:
+      each brain scores its own fitness through its digest face, blended with
+      its RECORD (the bandit ledger). Use the winner. If every score is soft,
+      no specialist exists — DESIGN one (engineer CONTEXT, register_brain) and
+      it becomes a new arm.
+  reward(name, value, source=..., note=...)
+      record how a brain actually performed, 0-1 — from a witnessed judge
+      verdict or the caller's acceptance, NEVER from a brain's own confidence.
+      This is what makes routing improve: gauge proposes, record tempers.
 
 Granularity is a cost dial — choose chunk size per task, not by habit:
   * A cognize sweep reads the whole corpus regardless of chunking; what scales
@@ -358,3 +406,32 @@ def _final_text(result: Any) -> str:
         if text:
             return text
     return str(result)
+
+
+# ── CLI — the agent as a SCRIPT a skill can call ─────────────────────────────
+
+def main(argv=None):
+    import argparse
+    import asyncio
+    import sys
+    ap = argparse.ArgumentParser(
+        prog="python -m brain_agent.orchestrator",
+        description="Run the RLM synthesizer agent on a task.")
+    ap.add_argument("task", help="the task; the agent manages its own work")
+    ap.add_argument("--kernel", default="rlm", help="runtime context name (persistent)")
+    ap.add_argument("--reset", action="store_true", help="fresh kernel + context")
+    ap.add_argument("--bind", action="append", default=[], metavar="NAME=FILE",
+                    help="load FILE into CONTEXT slot NAME (repeatable)")
+    args = ap.parse_args(argv)
+    orch = Orchestrator(kernel=args.kernel, reset=args.reset)
+    for spec in args.bind:
+        name, _, path = spec.partition("=")
+        from pathlib import Path as _P
+        orch.bind(**{name: _P(path).read_text(errors="replace")})
+    answer = asyncio.run(orch.run(args.task))
+    sys.stdout.write(answer + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

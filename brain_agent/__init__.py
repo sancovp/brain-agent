@@ -16,7 +16,7 @@ module: PyShell and Kernel import with the standard library alone.
 import importlib
 from typing import TYPE_CHECKING
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 _EXPORTS = {
     # canonical heaven brain (the substrate everything extends) — needs heaven
@@ -36,6 +36,7 @@ _EXPORTS = {
     "PyShell": "shell", "default_policy": "shell",
     "Orchestrator": "orchestrator", "shell_func": "orchestrator",
     "ContextDict": "context",
+    "record": "bandit", "blend": "bandit",
     "Kernel": "kernel", "serve": "kernel",
     # call-graph tracing — stdlib to record, networkx only to load
     "load_run": "trace", "text_tree": "trace", "load_records": "trace",
@@ -47,7 +48,7 @@ _ALIASES = {"ComposedBrain": ("sdk", "Brain")}
 # Submodules reachable as attributes. Without this, lazy __getattr__ shadows the
 # normal submodule lookup and `from brain_agent import trace` raises.
 _SUBMODULES = ("config", "brain_agent", "tools", "hierarchical", "rlm",
-               "sdk", "shell", "kernel", "trace", "orchestrator", "context")
+               "sdk", "shell", "kernel", "trace", "orchestrator", "context", "bandit")
 
 __all__ = sorted(list(_EXPORTS) + list(_ALIASES) + list(_SUBMODULES) + ["__version__"])
 
